@@ -93,10 +93,33 @@ Units are handled as follows:
 | `wind_speed`      | any speed (`m/s`, `km/h`, `mph`, `kn`…) | **auto-converted** to m/s by Home Assistant        |
 | `dewpoint`        | same unit class as temperature          | **auto-converted** to °C                           |
 | `solar_radiation` | **must be `W/m²`**                       | read as-is (integrated to MJ/m²/day internally)    |
-| `rain`            | **must be `mm`**                         | read as-is, uses the per-hour increase (`change`)  |
+| `rain`            | **must be `mm`**, `total_increasing`     | uses the per-hour increase (`change`) — see below  |
 
 So temperature and wind are converted from whatever your station reports; solar
 radiation and rain are read natively and must already be in `W/m²` and `mm`.
+
+> **The rain sensor must have `state_class: total_increasing`** (a cumulative
+> rainfall total). Home Assistant only derives the per-period `change` from a
+> `sum`, which only exists for `total`/`total_increasing` sensors. A `measurement`
+> rain sensor produces no `change`, so **precipitation would silently be treated as
+> zero** and you'd over-irrigate. The integration logs a warning if it detects
+> this. If your station only exposes rain *rate* (mm/h, measurement), feed a
+> [utility_meter](https://www.home-assistant.io/integrations/utility_meter/) or
+> Riemann-sum integral (giving a `total_increasing` mm total) instead.
+
+## Limitations (v1, by design)
+
+* **Window start assumes field capacity.** The deficit is integrated from the end
+  of the last irrigation, taking the soil as full (deficit 0) at that point — true
+  right after watering. In the fallback case (no irrigation within
+  `max_window_days`), it assumes field capacity that many days ago, which is a
+  guess; the `maximum_deficit` cap bounds the error, but after a long dry spell the
+  deficit can be **under-estimated**.
+* **Solar is integrated from hourly statistics.** Daily radiation is the sum of the
+  covered hours' mean irradiance. Recorder gaps at night are harmless (0), but
+  daytime gaps under-count the day's energy and slightly under-estimate ET.
+* **No soil/runoff model beyond the field-capacity cap.** Heavy rain above
+  `maximum_deficit` is treated as run-off; there is no drainage curve.
 
 ## Services
 

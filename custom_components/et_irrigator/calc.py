@@ -26,12 +26,13 @@ from .const import ALBEDO
 
 @dataclass
 class DayData:
-    """Aggregated weather for one calendar day inside the rolling window.
+    """Aggregated weather for one (possibly partial) day inside the window.
 
-    ``fraction`` is the portion of this day that falls within the window
-    (0 < fraction <= 1); reference ET for the day is scaled by it. Precipitation
-    is already the amount that fell during the in-window portion, so it is not
-    re-scaled.
+    A partial first/last day is represented by aggregating only the hourly
+    statistics that fall inside the window: ``solar_rad_mj`` is the energy of the
+    covered hours, ``t_min``/``t_max`` span the covered hours, and
+    ``precipitation_mm`` is the rain that fell in them. There is therefore no
+    separate day-fraction scaling — the partial coverage is already baked in.
     """
 
     day_of_year: int
@@ -39,7 +40,6 @@ class DayData:
     t_max: float
     solar_rad_mj: float
     wind_speed: float
-    fraction: float = 1.0
     t_mean: float | None = None
     wind_height: float = 2.0
     dewpoint: float | None = None
@@ -101,8 +101,8 @@ def _actual_vapour_pressure(day: DayData) -> float:
 def eto_fao56_day(day: DayData, latitude: float, elevation: float) -> float:
     """Reference ET (ETo) for one day [mm], FAO-56 Penman-Monteith.
 
-    Uses *measured* solar radiation for the net-radiation term. Result is the
-    full-day ETo (not yet scaled by ``day.fraction``).
+    Uses *measured* solar radiation for the net-radiation term. For a partial
+    first/last window day, ``day`` already holds only the covered hours' data.
     """
     lat_rad = pyeto.deg2rad(latitude)
     tmin, tmax = day.t_min, day.t_max
@@ -152,15 +152,17 @@ def duration_seconds(deficit: float, cfg: ZoneCalcConfig) -> int:
 def compute_zone(days: list[DayData], cfg: ZoneCalcConfig) -> ZoneResult:
     """Run the rolling-window calculation for one zone.
 
-    ``days`` are the per-day aggregates spanning [last_irrigation, now]; the soil
-    is assumed at field capacity (deficit 0) at the window start. The result is a
-    pure function of ``days`` + ``cfg`` -> idempotent.
+    ``days`` are the per-day aggregates spanning [last_irrigation, now]. The soil
+    is assumed at field capacity (deficit 0) at the window start; this holds right
+    after watering, but in the fallback case (no irrigation within max_window_days)
+    it is an assumption mitigated only by ``maximum_deficit``. The result is a pure
+    function of ``days`` + ``cfg`` -> idempotent.
     """
     daily_eto: list[float] = []
     eto_total = 0.0
     precip_total = 0.0
     for day in days:
-        eto = eto_fao56_day(day, cfg.latitude, cfg.elevation) * day.fraction
+        eto = eto_fao56_day(day, cfg.latitude, cfg.elevation)
         daily_eto.append(eto)
         eto_total += eto
         precip_total += day.precipitation_mm

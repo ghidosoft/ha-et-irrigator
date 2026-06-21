@@ -33,6 +33,7 @@ CONF_MAXIMUM_DURATION: Final = "maximum_duration"
 
 # --- Defaults --------------------------------------------------------------
 DEFAULT_WIND_MEASUREMENT_HEIGHT: Final = 2.0  # metres
+DEFAULT_WIND_SPEED: Final = 2.0  # m/s, FAO-56 default when wind data is missing
 DEFAULT_CROP_COEFFICIENT: Final = 1.0
 DEFAULT_MAX_WINDOW_DAYS: Final = 7
 DEFAULT_MAXIMUM_DEFICIT: Final = 30.0  # mm (field capacity cap)

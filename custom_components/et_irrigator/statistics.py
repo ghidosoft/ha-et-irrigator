@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .calc import DayData
+from .const import DEFAULT_WIND_SPEED
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,6 +138,19 @@ def build_days(
     dew_by_day = by_day(sensors.get("dewpoint"))
     rain_by_day = by_day(sensors.get("rain"))
 
+    # Rain needs a `total_increasing` sensor: HA only derives `change` from `sum`.
+    # If a rain sensor is configured and has rows but every `change` is None, it is
+    # almost certainly a `measurement` sensor -> precipitation would silently be 0.
+    rain_id = sensors.get("rain")
+    if rain_id and rain_id in stats and stats[rain_id]:
+        if all(r.get("change") is None for r in stats[rain_id]):
+            _LOGGER.warning(
+                "ET Irrigator: rain sensor '%s' returns no 'change' statistics. "
+                "Set its state_class to 'total_increasing' (a cumulative mm total) "
+                "or precipitation will be treated as zero",
+                rain_id,
+            )
+
     days: list[DayData] = []
     for day in sorted(temp_by_day):
         temp_rows = temp_by_day[day]
@@ -146,7 +160,10 @@ def build_days(
             continue
         t_mean = _mean([r.get("mean") for r in temp_rows])
 
-        wind = _mean([r.get("mean") for r in wind_by_day.get(day, [])]) or 0.0
+        # Distinguish genuine calm (0 m/s) from missing data: FAO-56 recommends a
+        # 2 m/s default when wind data is unavailable, so don't collapse None -> 0.
+        wind_mean = _mean([r.get("mean") for r in wind_by_day.get(day, [])])
+        wind = wind_mean if wind_mean is not None else DEFAULT_WIND_SPEED
 
         solar_mj = sum(
             (r["mean"] * _HOUR_SECONDS / 1_000_000.0)

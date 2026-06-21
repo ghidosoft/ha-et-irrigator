@@ -1,0 +1,5 @@
+recalculate:
+  name: Recalculate
+  description: >-
+    Force an immediate rolling-window recalculation of every zone from the
+    current long-term statistics. Idempotent — safe to call any time.

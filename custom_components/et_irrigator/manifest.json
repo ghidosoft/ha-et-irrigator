@@ -1,0 +1,13 @@
+{
+  "domain": "et_irrigator",
+  "name": "ET Irrigator",
+  "codeowners": ["@ghidosoft"],
+  "config_flow": false,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/ghidosoft/ha-et-irrigator",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/ghidosoft/ha-et-irrigator/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -121,7 +121,15 @@ def eto_fao56_day(day: DayData, latitude: float, elevation: float) -> float:
     clear_sky_rad = pyeto.cs_rad(elevation, extra_rad)
 
     ni_sw_rad = pyeto.net_in_sol_rad(day.solar_rad_mj, albedo=ALBEDO)
-    no_lw_rad = pyeto.net_out_lw_rad(tmin, tmax, day.solar_rad_mj, clear_sky_rad, avp)
+    # net_out_lw_rad applies the Stefan-Boltzmann law: temperatures MUST be in
+    # Kelvin. Passing Celsius collapses the longwave term to ~0 and inflates ETo.
+    no_lw_rad = pyeto.net_out_lw_rad(
+        pyeto.celsius2kelvin(tmin),
+        pyeto.celsius2kelvin(tmax),
+        day.solar_rad_mj,
+        clear_sky_rad,
+        avp,
+    )
     n_rad = pyeto.net_rad(ni_sw_rad, no_lw_rad)
 
     eto = pyeto.fao56_penman_monteith(

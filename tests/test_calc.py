@@ -40,7 +40,13 @@ def _expected_eto(day: DayData, latitude: float, elevation: float) -> float:
     extra = pyeto.et_rad(lat_rad, sd, sha, ird)
     csr = pyeto.cs_rad(elevation, extra)
     ni = pyeto.net_in_sol_rad(day.solar_rad_mj, albedo=0.23)
-    no = pyeto.net_out_lw_rad(day.t_min, day.t_max, day.solar_rad_mj, csr, avp)
+    no = pyeto.net_out_lw_rad(
+        pyeto.celsius2kelvin(day.t_min),
+        pyeto.celsius2kelvin(day.t_max),
+        day.solar_rad_mj,
+        csr,
+        avp,
+    )
     nr = pyeto.net_rad(ni, no)
     return pyeto.fao56_penman_monteith(
         nr, pyeto.celsius2kelvin(day.mean_temp), ws2, svp, avp, dsvp, psy
@@ -55,8 +61,34 @@ def test_eto_matches_raw_pyeto_pipeline():
 
 def test_eto_summer_day_is_physically_sane():
     eto = eto_fao56_day(_summer_day(), latitude=45.0, elevation=250.0)
-    # A clear hot mid-latitude summer day -> roughly 4-9 mm/day.
-    assert 3.5 < eto < 9.0
+    # Clear hot mid-latitude summer day. Tight band: the previous loose 3.5-9.0
+    # let a Celsius/Kelvin bug in the longwave term (which inflated ETo ~16%)
+    # slip through. With longwave applied correctly this sits ~5.5-6.5 mm/day.
+    assert 5.0 < eto < 7.0
+
+
+def test_longwave_loss_is_applied():
+    """Guard the Kelvin bug directly: outgoing longwave must reduce ETo.
+
+    If net_out_lw_rad is fed Celsius the longwave term collapses to ~0 and ETo
+    jumps. This asserts the longwave loss is materially non-zero.
+    """
+    from custom_components.et_irrigator import pyeto
+
+    day = _summer_day()
+    lat_rad = pyeto.deg2rad(45.0)
+    sd = pyeto.sol_dec(day.day_of_year)
+    sha = pyeto.sunset_hour_angle(lat_rad, sd)
+    ird = pyeto.inv_rel_dist_earth_sun(day.day_of_year)
+    csr = pyeto.cs_rad(250.0, pyeto.et_rad(lat_rad, sd, sha, ird))
+    no_lw = pyeto.net_out_lw_rad(
+        pyeto.celsius2kelvin(day.t_min),
+        pyeto.celsius2kelvin(day.t_max),
+        day.solar_rad_mj,
+        csr,
+        pyeto.avp_from_tdew(day.dewpoint),
+    )
+    assert no_lw > 3.0  # realistic clear-day net longwave is several MJ/m²/day, not ~0
 
 
 def test_eto_increases_with_solar_radiation():

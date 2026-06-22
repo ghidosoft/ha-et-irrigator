@@ -8,8 +8,9 @@ to the recorder's own executor (never the event loop).
 from __future__ import annotations
 
 import logging
+import math
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.recorder import get_instance, history
@@ -18,7 +19,7 @@ from homeassistant.const import UnitOfSpeed, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .calc import DayData
+from .calc import DayData, HourData
 from .const import DEFAULT_WIND_SPEED
 
 _LOGGER = logging.getLogger(__name__)
@@ -107,6 +108,111 @@ async def async_fetch_statistics(
     )
 
 
+def _warn_if_rain_not_cumulative(
+    stats: dict[str, list[dict[str, Any]]], rain_id: str | None
+) -> None:
+    """Rain needs a `total_increasing` sensor: HA only derives `change` from `sum`.
+
+    If a rain sensor is configured and has rows but every `change` is None, it is
+    almost certainly a `measurement` sensor -> precipitation would silently be 0.
+    """
+    if rain_id and rain_id in stats and stats[rain_id]:
+        if all(r.get("change") is None for r in stats[rain_id]):
+            _LOGGER.warning(
+                "ET Irrigator: rain sensor '%s' returns no 'change' statistics. "
+                "Set its state_class to 'total_increasing' (a cumulative mm total) "
+                "or precipitation will be treated as zero",
+                rain_id,
+            )
+
+
+def _solar_time_hours(
+    midpoint_utc: datetime, longitude: float, day_of_year: int
+) -> float:
+    """Solar time at the hour midpoint [hours] — FAO-56 Eqs. 31-33.
+
+    longitude is the site longitude in degrees (east positive, as in HA config).
+    """
+    utc_h = (
+        midpoint_utc.hour
+        + midpoint_utc.minute / 60.0
+        + midpoint_utc.second / 3600.0
+    )
+    b = 2 * math.pi * (day_of_year - 81) / 364.0
+    seasonal = 0.1645 * math.sin(2 * b) - 0.1255 * math.cos(b) - 0.025 * math.sin(b)
+    return utc_h + longitude / 15.0 + seasonal
+
+
+def build_hours(
+    stats: dict[str, list[dict[str, Any]]],
+    sensors: dict[str, str | None],
+    wind_height: float,
+    longitude: float,
+) -> list[HourData]:
+    """Build one :class:`HourData` per clock hour for the hourly ETo method.
+
+    Channels are aligned by the statistic-row hour boundary. Solar radiation is
+    integrated from W/m2 to MJ/m2/h; wind/dewpoint/temperature use the hourly
+    mean; rain uses the per-hour ``change``. ``solar_time_hours`` is derived from
+    the hour midpoint + site longitude for the FAO-56 hour angle.
+    """
+    temp_id = sensors.get("temperature")
+    if not temp_id or temp_id not in stats:
+        return []
+
+    def index(entity_id: str | None) -> dict[int, dict[str, Any]]:
+        out: dict[int, dict[str, Any]] = {}
+        if entity_id and entity_id in stats:
+            for row in stats[entity_id]:
+                out[int(_row_start(row).timestamp())] = row
+        return out
+
+    wind_ix = index(sensors.get("wind_speed"))
+    solar_ix = index(sensors.get("solar_radiation"))
+    dew_ix = index(sensors.get("dewpoint"))
+    rain_ix = index(sensors.get("rain"))
+
+    _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
+
+    hours: list[HourData] = []
+    for row in stats[temp_id]:
+        t = row.get("mean")
+        if t is None:
+            continue
+        start = _row_start(row)
+        key = int(start.timestamp())
+        midpoint = start + timedelta(minutes=30)
+        doy = midpoint.timetuple().tm_yday  # UTC day-of-year (matches solar-time frame)
+
+        wind_row = wind_ix.get(key)
+        wind = wind_row.get("mean") if wind_row else None
+        wind = wind if wind is not None else DEFAULT_WIND_SPEED
+
+        solar_row = solar_ix.get(key)
+        solar_mean = solar_row.get("mean") if solar_row else None
+        solar_mj = (solar_mean or 0.0) * _HOUR_SECONDS / 1_000_000.0
+
+        dew_row = dew_ix.get(key)
+        dewpoint = dew_row.get("mean") if dew_row else None
+
+        rain_row = rain_ix.get(key)
+        precip = rain_row.get("change") if rain_row else None
+
+        hours.append(
+            HourData(
+                day_of_year=doy,
+                solar_time_hours=_solar_time_hours(midpoint, longitude, doy),
+                t=t,
+                solar_rad_mj=solar_mj,
+                wind_speed=wind,
+                wind_height=wind_height,
+                dewpoint=dewpoint,
+                precipitation_mm=precip if precip is not None else 0.0,
+            )
+        )
+    return hours
+
+
 def build_days(
     stats: dict[str, list[dict[str, Any]]],
     sensors: dict[str, str | None],
@@ -138,18 +244,7 @@ def build_days(
     dew_by_day = by_day(sensors.get("dewpoint"))
     rain_by_day = by_day(sensors.get("rain"))
 
-    # Rain needs a `total_increasing` sensor: HA only derives `change` from `sum`.
-    # If a rain sensor is configured and has rows but every `change` is None, it is
-    # almost certainly a `measurement` sensor -> precipitation would silently be 0.
-    rain_id = sensors.get("rain")
-    if rain_id and rain_id in stats and stats[rain_id]:
-        if all(r.get("change") is None for r in stats[rain_id]):
-            _LOGGER.warning(
-                "ET Irrigator: rain sensor '%s' returns no 'change' statistics. "
-                "Set its state_class to 'total_increasing' (a cumulative mm total) "
-                "or precipitation will be treated as zero",
-                rain_id,
-            )
+    _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
 
     days: list[DayData] = []
     for day in sorted(temp_by_day):

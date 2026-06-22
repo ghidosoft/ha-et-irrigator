@@ -31,9 +31,11 @@ For each zone, on every recompute:
    (a `binary_sensor`/`switch` that is `on` while watering). If none in the last
    `max_window_days`, fall back to that cap.
 2. Read hourly long-term statistics for your weather sensors over
-   `[reference → now]` and aggregate them per day.
-3. Compute daily reference ET (FAO-56 Penman-Monteith, using your **measured solar
-   radiation**), sum it over the window, multiply by the crop coefficient `Kc`.
+   `[reference → now]`.
+3. Compute reference ET (FAO-56 Penman-Monteith, using your **measured solar
+   radiation**) over the window and multiply by the crop coefficient `Kc`. By
+   default this is the **hourly** equation (FAO-56 Eq. 53) summed per hour — see
+   *ET method* below — or the daily equation per calendar day.
 4. `deficit = clamp(ΣET·Kc − Σrain, 0, maximum_deficit)`.
 5. `duration = deficit / rate × 3600`, where
    `rate [mm/h] = throughput [L/min] × 60 / area [m²]`, then apply `multiplier`,
@@ -57,8 +59,9 @@ No Python requirements are pulled in: the FAO-56 maths are vendored
 
 ```yaml
 et_irrigator:
-  # elevation defaults to your HA location; latitude is taken from HA.
+  # elevation defaults to your HA location; latitude/longitude are taken from HA.
   elevation: 250
+  et_method: hourly             # hourly (default) | daily
   wind_measurement_height: 10   # metres; your anemometer height (default 2)
   sensors:
     temperature: sensor.ws_temperature      # required
@@ -106,6 +109,21 @@ radiation and rain are read natively and must already be in `W/m²` and `mm`.
 > this. If your station only exposes rain *rate* (mm/h, measurement), feed a
 > [utility_meter](https://www.home-assistant.io/integrations/utility_meter/) or
 > Riemann-sum integral (giving a `total_increasing` mm total) instead.
+
+### ET method (`et_method`)
+
+* **`hourly`** (default) — FAO-56 hourly Penman-Monteith (Eq. 53) computed for
+  each hour and summed over the window. Matches the hourly granularity of the
+  data: the window edges (e.g. an irrigation at 05:30) are exact rather than a
+  partial-day approximation, and the integrated deficit is **monotonic** between
+  irrigations (no day-aggregate revision wobble). Recommended.
+* **`daily`** — FAO-56 daily Penman-Monteith (Eq. 6) per calendar day. Slightly
+  cheaper, kept mainly for A/B comparison; the in-progress day's estimate is
+  revised as new hours arrive, so the duration can wobble a few seconds.
+
+Both use your measured solar radiation. Over full days they agree within a few
+percent (hourly-summed is typically a touch lower and is considered more accurate
+under variable conditions).
 
 ## Limitations (v1, by design)
 

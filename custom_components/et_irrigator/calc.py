@@ -3,12 +3,13 @@
 This module has **no Home Assistant dependencies** so it can be unit-tested in
 isolation and validated against the canonical FAO-56 worked examples. All input
 aggregation from HA long-term statistics happens in ``statistics.py``; here we
-only consume already-aggregated daily weather and emit a per-zone result.
+consume already-aggregated weather (per day for the daily method, per hour for
+the hourly method) and emit a per-zone result.
 
 Units (metric, FAO-56 conventions):
   * temperatures        deg C
   * wind speed          m s-1
-  * solar radiation     MJ m-2 day-1 (daily total, full-day equivalent)
+  * solar radiation     MJ m-2 per period (day for DayData, hour for HourData)
   * vapour pressure     kPa
   * precipitation / ET  mm
   * area                m2
@@ -18,6 +19,7 @@ Units (metric, FAO-56 conventions):
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from . import pyeto
@@ -157,43 +159,149 @@ def duration_seconds(deficit: float, cfg: ZoneCalcConfig) -> int:
     return round(cfg.lead_time + seconds)
 
 
-def compute_zone(days: list[DayData], cfg: ZoneCalcConfig) -> ZoneResult:
-    """Run the rolling-window calculation for one zone.
-
-    ``days`` are the per-day aggregates spanning [last_irrigation, now]. The soil
-    is assumed at field capacity (deficit 0) at the window start; this holds right
-    after watering, but in the fallback case (no irrigation within max_window_days)
-    it is an assumption mitigated only by ``maximum_deficit``. The result is a pure
-    function of ``days`` + ``cfg`` -> idempotent.
-    """
-    daily_eto: list[float] = []
-    eto_total = 0.0
-    precip_total = 0.0
-    for day in days:
-        eto = eto_fao56_day(day, cfg.latitude, cfg.elevation)
-        daily_eto.append(eto)
-        eto_total += eto
-        precip_total += day.precipitation_mm
-
+def _balance_result(
+    eto_total: float,
+    precip_total: float,
+    n_points: int,
+    cfg: ZoneCalcConfig,
+    window_label: str,
+    per_step_eto: list[float],
+) -> ZoneResult:
+    """Turn an integrated ETo + precipitation over the window into a result."""
     eto_crop = eto_total * cfg.crop_coefficient
     delta = precip_total - eto_crop
     deficit = min(cfg.maximum_deficit, max(0.0, -delta))
     duration = duration_seconds(deficit, cfg)
 
     explanation = (
-        f"window={len(days)}d ETo*Kc={eto_crop:.2f}mm precip={precip_total:.2f}mm "
+        f"window={window_label} ETo*Kc={eto_crop:.2f}mm precip={precip_total:.2f}mm "
         f"deficit={deficit:.2f}mm rate="
         f"{(cfg.throughput * 60.0 / cfg.area) if cfg.area else 0:.2f}mm/h "
         f"-> {duration}s"
     )
-
     return ZoneResult(
         duration=duration,
         deficit=round(deficit, 3),
         evapotranspiration=round(eto_crop, 3),
         precipitation=round(precip_total, 3),
         delta=round(delta, 3),
-        number_of_data_points=len(days),
+        number_of_data_points=n_points,
         explanation=explanation,
-        daily_eto=[round(e, 3) for e in daily_eto],
+        daily_eto=[round(e, 3) for e in per_step_eto],
+    )
+
+
+def compute_zone(days: list[DayData], cfg: ZoneCalcConfig) -> ZoneResult:
+    """Daily-method rolling-window calculation for one zone.
+
+    ``days`` are the per-day aggregates spanning [last_irrigation, now]. The soil
+    is assumed at field capacity (deficit 0) at the window start; this holds right
+    after watering, but in the fallback case (no irrigation within max_window_days)
+    it is an assumption mitigated only by ``maximum_deficit``. Pure function of
+    ``days`` + ``cfg`` -> idempotent.
+    """
+    eto = [eto_fao56_day(d, cfg.latitude, cfg.elevation) for d in days]
+    return _balance_result(
+        sum(eto), sum(d.precipitation_mm for d in days), len(days), cfg,
+        f"{len(days)}d", eto,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hourly FAO-56 (Penman-Monteith, Eq. 53) — preferred for the rolling window.
+#
+# Computing ET per hour (our data granularity) instead of per calendar day
+# removes the partial-day approximation and makes the integrated deficit
+# monotonic between irrigations. The daily equation is NOT just this / 24:
+# the hourly form uses different constants (37 vs 900), a day/night wind
+# coefficient Cd (0.24 / 0.96) and a non-negligible soil heat flux G
+# (0.1*Rn day, 0.5*Rn night). pyeto only ships the daily equation, so the
+# assembly below is ours; the sub-terms reuse pyeto where the maths are
+# period-agnostic (svp, avp, psy, wind, net shortwave, clear-sky).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HourData:
+    """Aggregated weather for one clock hour inside the rolling window."""
+
+    day_of_year: int
+    solar_time_hours: float  # solar time at the hour midpoint (for the hour angle)
+    t: float  # mean hourly temperature, deg C
+    solar_rad_mj: float  # hourly solar radiation total, MJ m-2 h-1
+    wind_speed: float  # m s-1
+    wind_height: float = 2.0
+    dewpoint: float | None = None
+    precipitation_mm: float = 0.0
+
+
+def ra_hourly(latitude: float, day_of_year: int, solar_time_hours: float,
+              period_h: float = 1.0) -> float:
+    """Extraterrestrial radiation for one hour [MJ m-2 h-1] — FAO-56 Eq. 28.
+
+    Clamped to 0 at night (sun below horizon).
+    """
+    phi = pyeto.deg2rad(latitude)
+    dr = pyeto.inv_rel_dist_earth_sun(day_of_year)
+    dec = pyeto.sol_dec(day_of_year)
+    w = math.radians((solar_time_hours - 12.0) * 15.0)  # hour angle at midpoint
+    w1 = w - math.pi * period_h / 24.0
+    w2 = w + math.pi * period_h / 24.0
+    ra = ((12 * 60 / math.pi) * pyeto.SOLAR_CONSTANT * dr * (
+        (w2 - w1) * math.sin(phi) * math.sin(dec)
+        + math.cos(phi) * math.cos(dec) * (math.sin(w2) - math.sin(w1))
+    ))
+    return max(0.0, ra)
+
+
+def _avp_hourly(hour: HourData) -> float:
+    """Actual vapour pressure [kPa] for the hour (dewpoint preferred)."""
+    if hour.dewpoint is not None:
+        return pyeto.avp_from_tdew(hour.dewpoint)
+    # Degraded fallback (no humidity input): assume saturation -> kills the
+    # aerodynamic term, ET from radiation only. Dewpoint is recommended.
+    return pyeto.svp_from_t(hour.t)
+
+
+def eto_fao56_hourly(hour: HourData, latitude: float, elevation: float) -> float:
+    """Reference ET for one hour [mm h-1], FAO-56 Penman-Monteith (Eq. 53)."""
+    t = hour.t
+    delta = pyeto.delta_svp(t)
+    psy = pyeto.psy_const(pyeto.atm_pressure(elevation))
+    es = pyeto.svp_from_t(t)
+    ea = _avp_hourly(hour)
+    u2 = pyeto.wind_speed_2m(hour.wind_speed, hour.wind_height)
+
+    ra = ra_hourly(latitude, hour.day_of_year, hour.solar_time_hours)
+    rso = pyeto.cs_rad(elevation, ra) if ra > 0 else 0.0
+    ni_sw = pyeto.net_in_sol_rad(hour.solar_rad_mj, albedo=ALBEDO)
+    t_k = pyeto.celsius2kelvin(t)
+    if rso > 0:
+        # Reuse the daily longwave with tmin=tmax=T_hr (so (T^4+T^4)/2 = T^4)
+        # and /24 to turn the daily Stefan-Boltzmann constant into the hourly one.
+        no_lw = pyeto.net_out_lw_rad(t_k, t_k, hour.solar_rad_mj, rso, ea) / 24.0
+    else:
+        # Night: Rs/Rso is undefined; use a representative cloudiness factor.
+        sigma_hr = pyeto.STEFAN_BOLTZMANN_CONSTANT / 24.0
+        no_lw = sigma_hr * t_k**4 * (0.34 - 0.14 * math.sqrt(ea)) * (1.35 * 0.4 - 0.35)
+    rn = ni_sw - no_lw
+
+    g = 0.1 * rn if rn > 0 else 0.5 * rn  # soil heat flux, day / night
+    cd = 0.24 if rn > 0 else 0.96
+    num = 0.408 * delta * (rn - g) + psy * (37.0 / (t + 273.0)) * u2 * (es - ea)
+    den = delta + psy * (1 + cd * u2)
+    return max(0.0, num / den)
+
+
+def compute_zone_hourly(hours: list[HourData], cfg: ZoneCalcConfig) -> ZoneResult:
+    """Hourly-method rolling-window calculation for one zone.
+
+    Sums per-hour ETo over the window. Because each completed hour's data is
+    final, the integrated deficit is monotonic between irrigations (no daily
+    re-aggregation wobble). Pure function of ``hours`` + ``cfg`` -> idempotent.
+    """
+    eto = [eto_fao56_hourly(h, cfg.latitude, cfg.elevation) for h in hours]
+    return _balance_result(
+        sum(eto), sum(h.precipitation_mm for h in hours), len(hours), cfg,
+        f"{len(hours)}h", eto,
     )

@@ -13,6 +13,7 @@ from custom_components.et_irrigator.const import DEFAULT_WIND_SPEED
 from custom_components.et_irrigator.statistics import (
     async_fetch_statistics,
     build_days,
+    build_hours,
 )
 
 
@@ -118,3 +119,52 @@ async def test_wind_kmh_is_converted_to_ms(recorder_mock, hass):
     assert days, "expected at least one aggregated day"
     assert abs(days[0].wind_speed - 10.0) < 1e-6  # 36 km/h -> 10 m/s
     assert abs(days[0].t_min - 20.0) < 1e-6
+
+
+# --- build_hours (hourly method) -------------------------------------------
+
+def _aligned_rows(value_key, value, *, n=3):
+    base = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    return [{"start": base + timedelta(hours=i), value_key: value} for i in range(n)]
+
+
+def test_build_hours_aligns_channels_and_converts_solar():
+    stats = {
+        "sensor.t": _aligned_rows("mean", 25.0),
+        "sensor.w": _aligned_rows("mean", 3.0),
+        "sensor.s": _aligned_rows("mean", 800.0),  # W/m2
+        "sensor.d": _aligned_rows("mean", 16.0),
+        "sensor.r": _aligned_rows("change", 0.2),
+    }
+    sensors = {
+        "temperature": "sensor.t",
+        "wind_speed": "sensor.w",
+        "solar_radiation": "sensor.s",
+        "dewpoint": "sensor.d",
+        "rain": "sensor.r",
+    }
+    hours = build_hours(stats, sensors, wind_height=10.0, longitude=10.0)
+
+    assert len(hours) == 3
+    h = hours[0]
+    assert h.t == 25.0
+    assert h.wind_speed == 3.0
+    assert h.dewpoint == 16.0
+    assert abs(h.solar_rad_mj - 800.0 * 3600 / 1_000_000.0) < 1e-9  # -> 2.88 MJ/m²/h
+    assert h.precipitation_mm == 0.2
+    assert h.wind_height == 10.0
+    # 12:30 UTC midpoint, lon +10° -> solar time ~13.2h (+ small seasonal term)
+    assert 12.8 < h.solar_time_hours < 13.6
+
+
+def test_build_hours_wind_defaults_when_missing():
+    stats = {"sensor.t": _aligned_rows("mean", 22.0)}
+    sensors = {
+        "temperature": "sensor.t",
+        "wind_speed": None,
+        "solar_radiation": None,
+        "dewpoint": None,
+        "rain": None,
+    }
+    hours = build_hours(stats, sensors, wind_height=2.0, longitude=10.0)
+    assert hours and all(h.wind_speed == DEFAULT_WIND_SPEED for h in hours)

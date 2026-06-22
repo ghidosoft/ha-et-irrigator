@@ -10,6 +10,11 @@ DOMAIN: Final = "et_irrigator"
 CONF_ELEVATION: Final = "elevation"
 CONF_SENSORS: Final = "sensors"
 CONF_ZONES: Final = "zones"
+CONF_ET_METHOD: Final = "et_method"
+
+ET_METHOD_HOURLY: Final = "hourly"
+ET_METHOD_DAILY: Final = "daily"
+DEFAULT_ET_METHOD: Final = ET_METHOD_HOURLY
 
 # --- Weather sensor keys ---------------------------------------------------
 CONF_TEMPERATURE: Final = "temperature"

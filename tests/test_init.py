@@ -15,6 +15,7 @@ ENTITY = "sensor.et_irrigator_prato"
 CONFIG = {
     DOMAIN: {
         "elevation": 250,
+        "et_method": "daily",  # these wiring tests mock the daily data layer
         "sensors": {
             "temperature": "sensor.t",
             "dewpoint": "sensor.d",
@@ -116,6 +117,48 @@ async def test_heavy_rain_yields_zero_duration(
     state = hass.states.get(ENTITY)
     assert state.state == "0"
     assert state.attributes["deficit"] == 0.0
+
+
+async def test_hourly_method_end_to_end(
+    recorder_mock, hass, enable_et_irrigator, monkeypatch
+):
+    """Default hourly method: build_hours -> compute_zone_hourly -> sensor."""
+    from custom_components.et_irrigator.calc import HourData
+
+    hourly_config = {DOMAIN: {**CONFIG[DOMAIN], "et_method": "hourly"}}
+
+    async def fake_last(hass, entity_id, window_start, now):
+        return _REF
+
+    async def fake_fetch(hass, ids, start, now):
+        return {}
+
+    def fake_build_hours(stats, sensors, wind_height, longitude):
+        # Six strong-sun midday hours -> a real (positive) deficit.
+        return [
+            HourData(
+                day_of_year=196,
+                solar_time_hours=10.5 + i,
+                t=30.0,
+                solar_rad_mj=2.6,
+                wind_speed=2.0,
+                dewpoint=14.0,
+            )
+            for i in range(6)
+        ]
+
+    monkeypatch.setattr(coord_mod, "async_last_irrigation_end", fake_last)
+    monkeypatch.setattr(coord_mod, "async_fetch_statistics", fake_fetch)
+    monkeypatch.setattr(coord_mod, "build_hours", fake_build_hours)
+
+    assert await async_setup_component(hass, DOMAIN, hourly_config)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(ENTITY)
+    assert state is not None
+    assert int(state.state) > 0
+    assert state.attributes["number_of_data_points"] == 6
+    assert "6h" in state.attributes["explanation"]
 
 
 async def test_recalculate_service_is_idempotent_and_reflects_new_data(

@@ -17,6 +17,7 @@ from .const import (
     CONF_CROP_COEFFICIENT,
     CONF_DEWPOINT,
     CONF_ELEVATION,
+    CONF_ET_METHOD,
     CONF_IRRIGATION_SENSOR,
     CONF_LEAD_TIME,
     CONF_MAX_WINDOW_DAYS,
@@ -33,6 +34,7 @@ from .const import (
     CONF_WIND_SPEED,
     CONF_ZONES,
     DEFAULT_CROP_COEFFICIENT,
+    DEFAULT_ET_METHOD,
     DEFAULT_LEAD_TIME,
     DEFAULT_MAX_WINDOW_DAYS,
     DEFAULT_MAXIMUM_DEFICIT,
@@ -40,6 +42,8 @@ from .const import (
     DEFAULT_MULTIPLIER,
     DEFAULT_WIND_MEASUREMENT_HEIGHT,
     DOMAIN,
+    ET_METHOD_DAILY,
+    ET_METHOD_HOURLY,
     SERVICE_RECALCULATE,
 )
 from .coordinator import ETIrrigatorCoordinator, ZoneConfig
@@ -95,6 +99,9 @@ CONFIG_SCHEMA = vol.Schema(
                     CONF_WIND_MEASUREMENT_HEIGHT,
                     default=DEFAULT_WIND_MEASUREMENT_HEIGHT,
                 ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_ET_METHOD, default=DEFAULT_ET_METHOD
+                ): vol.In([ET_METHOD_HOURLY, ET_METHOD_DAILY]),
                 vol.Required(CONF_SENSORS): SENSORS_SCHEMA,
                 vol.Required(CONF_ZONES): vol.All(
                     cv.ensure_list, [ZONE_SCHEMA], vol.Length(min=1)
@@ -145,7 +152,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         )
 
     coordinator = ETIrrigatorCoordinator(
-        hass, sensors=sensors, wind_height=wind_height, zones=zones
+        hass,
+        sensors=sensors,
+        wind_height=wind_height,
+        zones=zones,
+        et_method=conf[CONF_ET_METHOD],
+        longitude=hass.config.longitude,
     )
     hass.data[DOMAIN] = coordinator
 

@@ -5,10 +5,14 @@ import math
 from custom_components.et_irrigator import pyeto
 from custom_components.et_irrigator.calc import (
     DayData,
+    HourData,
     ZoneCalcConfig,
     compute_zone,
+    compute_zone_hourly,
     duration_seconds,
     eto_fao56_day,
+    eto_fao56_hourly,
+    ra_hourly,
 )
 
 
@@ -168,3 +172,94 @@ def test_crop_coefficient_scales_et():
         compute_zone(days, base).evapotranspiration * 1.5,
         rel_tol=1e-3,  # 3-decimal rounding noise on the stored value
     )
+
+
+# --- Hourly FAO-56 method ---------------------------------------------------
+
+def _solar_hour(hour_of_day, **overrides):
+    """A synthetic HourData where clock == solar time (longitude ignored)."""
+    base = dict(
+        day_of_year=196,
+        solar_time_hours=hour_of_day,
+        t=24.0,
+        solar_rad_mj=2.0,
+        wind_speed=2.0,
+        dewpoint=16.0,
+    )
+    base.update(overrides)
+    return HourData(**base)
+
+
+def test_ra_hourly_zero_at_night_positive_at_noon():
+    noon = ra_hourly(45.0, 196, 12.5)
+    night = ra_hourly(45.0, 196, 2.5)
+    assert noon > 0.0
+    assert night == 0.0
+
+
+def test_eto_hourly_noon_is_sane_and_positive():
+    # Hot sunny midday hour -> a fraction of a mm in one hour.
+    eto = eto_fao56_hourly(_solar_hour(13.0, t=32.0, solar_rad_mj=3.0), 45.0, 160.0)
+    assert 0.1 < eto < 1.2
+
+
+def test_eto_hourly_night_lower_than_day():
+    day = eto_fao56_hourly(_solar_hour(13.0, t=30.0, solar_rad_mj=3.0), 45.0, 160.0)
+    night = eto_fao56_hourly(_solar_hour(2.0, t=20.0, solar_rad_mj=0.0), 45.0, 160.0)
+    assert night < day
+
+
+def _synthetic_day_hours(doy=196):
+    """24 hours of a clear sinusoidal summer day (clock == solar time)."""
+    hours = []
+    for h in range(24):
+        x = math.cos((h + 0.5 - 12) / 12 * math.pi)
+        solar_w = max(0.0, 900 * x) if 5 < (h + 0.5) < 19 else 0.0
+        t = 29 - 7 * math.cos((h + 0.5 - 15) / 12 * math.pi)
+        hours.append(
+            HourData(
+                day_of_year=doy,
+                solar_time_hours=h + 0.5,
+                t=t,
+                solar_rad_mj=solar_w * 3600 / 1e6,
+                wind_speed=1.5,
+                dewpoint=19.0,
+            )
+        )
+    return hours
+
+
+def test_hourly_sum_close_to_daily():
+    """Summed 24 hourly ETo should track the daily PM value within ~15%."""
+    hours = _synthetic_day_hours()
+    eto_hourly_sum = sum(eto_fao56_hourly(h, 45.0, 160.0) for h in hours)
+
+    solar_day = sum(h.solar_rad_mj for h in hours)
+    tmin = min(h.t for h in hours)
+    tmax = max(h.t for h in hours)
+    day = DayData(
+        day_of_year=196, t_min=tmin, t_max=tmax, solar_rad_mj=solar_day,
+        wind_speed=1.5, dewpoint=19.0,
+    )
+    eto_daily = eto_fao56_day(day, 45.0, 160.0)
+    assert abs(eto_hourly_sum - eto_daily) / eto_daily < 0.15
+
+
+def test_hourly_deficit_is_monotonic():
+    """Adding completed hours can only grow (never shrink) the deficit."""
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, area=50.0, throughput=12.0)
+    hours = _synthetic_day_hours()
+    prev = -1.0
+    for n in range(1, len(hours) + 1):
+        d = compute_zone_hourly(hours[:n], cfg).deficit
+        assert d >= prev - 1e-9  # non-decreasing
+        prev = d
+
+
+def test_compute_zone_hourly_rain_cancels_et():
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, area=50.0, throughput=12.0)
+    hours = _synthetic_day_hours()
+    hours[12] = HourData(**{**hours[12].__dict__, "precipitation_mm": 50.0})
+    res = compute_zone_hourly(hours, cfg)
+    assert res.deficit == 0.0
+    assert res.duration == 0

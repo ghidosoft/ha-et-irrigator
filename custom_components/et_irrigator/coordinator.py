@@ -10,12 +10,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util, slugify
 
-from .calc import ZoneCalcConfig, ZoneResult, compute_zone
-from .const import DOMAIN
+from .calc import ZoneCalcConfig, ZoneResult, compute_zone, compute_zone_hourly
+from .const import DOMAIN, ET_METHOD_HOURLY
 from .statistics import (
     async_fetch_statistics,
     async_last_irrigation_end,
     build_days,
+    build_hours,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class ETIrrigatorCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         sensors: dict[str, str | None],
         wind_height: float,
         zones: list[ZoneConfig],
+        et_method: str = ET_METHOD_HOURLY,
+        longitude: float = 0.0,
     ) -> None:
         super().__init__(
             hass,
@@ -57,6 +60,8 @@ class ETIrrigatorCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.sensors = sensors
         self.wind_height = wind_height
         self.zones = zones
+        self.et_method = et_method
+        self.longitude = longitude
 
     @property
     def weather_ids(self) -> set[str]:
@@ -89,8 +94,14 @@ class ETIrrigatorCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         stats = await async_fetch_statistics(
             self.hass, self.weather_ids, reference, now
         )
-        days = build_days(stats, self.sensors, self.wind_height)
-        result: ZoneResult = compute_zone(days, zone.calc)
+        if self.et_method == ET_METHOD_HOURLY:
+            hours = build_hours(
+                stats, self.sensors, self.wind_height, self.longitude
+            )
+            result: ZoneResult = compute_zone_hourly(hours, zone.calc)
+        else:
+            days = build_days(stats, self.sensors, self.wind_height)
+            result = compute_zone(days, zone.calc)
 
         return {
             "name": zone.name,

@@ -27,6 +27,7 @@ from .const import (
     CONF_MAXIMUM_DURATION,
     CONF_MULTIPLIER,
     CONF_NAME,
+    CONF_PRECIPITATION_RATE,
     CONF_RAIN,
     CONF_SENSORS,
     CONF_SOLAR_RADIATION,
@@ -71,27 +72,45 @@ SENSORS_SCHEMA = vol.Schema(
     }
 )
 
-ZONE_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_NAME): cv.string,
-        vol.Required(CONF_AREA): vol.All(vol.Coerce(float), vol.Range(min=0.0001)),
-        vol.Required(CONF_THROUGHPUT): vol.All(vol.Coerce(float), vol.Range(min=0.0001)),
-        vol.Optional(
-            CONF_CROP_COEFFICIENT, default=DEFAULT_CROP_COEFFICIENT
-        ): vol.Coerce(float),
-        vol.Optional(CONF_IRRIGATION_SENSOR): cv.entity_id,
-        vol.Optional(
-            CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
-        ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
-        vol.Optional(
-            CONF_MAXIMUM_DEFICIT, default=DEFAULT_MAXIMUM_DEFICIT
-        ): vol.Coerce(float),
-        vol.Optional(CONF_MULTIPLIER, default=DEFAULT_MULTIPLIER): vol.Coerce(float),
-        vol.Optional(CONF_LEAD_TIME, default=DEFAULT_LEAD_TIME): vol.Coerce(int),
-        vol.Optional(
-            CONF_MAXIMUM_DURATION, default=DEFAULT_MAXIMUM_DURATION
-        ): vol.Coerce(int),
-    }
+def _zone_has_rate_source(zone: dict) -> dict:
+    """Each zone needs an application rate: precipitation_rate, or area+throughput."""
+    has_rate = CONF_PRECIPITATION_RATE in zone
+    has_area_throughput = CONF_AREA in zone and CONF_THROUGHPUT in zone
+    if not (has_rate or has_area_throughput):
+        raise vol.Invalid(
+            f"zone '{zone.get(CONF_NAME, '?')}' needs '{CONF_PRECIPITATION_RATE}' "
+            f"or both '{CONF_AREA}' and '{CONF_THROUGHPUT}'"
+        )
+    return zone
+
+
+_POSITIVE_FLOAT = vol.All(vol.Coerce(float), vol.Range(min=0.0001))
+
+ZONE_SCHEMA = vol.All(
+    vol.Schema(
+        {
+            vol.Required(CONF_NAME): cv.string,
+            vol.Optional(CONF_AREA): _POSITIVE_FLOAT,
+            vol.Optional(CONF_THROUGHPUT): _POSITIVE_FLOAT,
+            vol.Optional(CONF_PRECIPITATION_RATE): _POSITIVE_FLOAT,
+            vol.Optional(
+                CONF_CROP_COEFFICIENT, default=DEFAULT_CROP_COEFFICIENT
+            ): vol.Coerce(float),
+            vol.Optional(CONF_IRRIGATION_SENSOR): cv.entity_id,
+            vol.Optional(
+                CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
+            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
+            vol.Optional(
+                CONF_MAXIMUM_DEFICIT, default=DEFAULT_MAXIMUM_DEFICIT
+            ): vol.Coerce(float),
+            vol.Optional(CONF_MULTIPLIER, default=DEFAULT_MULTIPLIER): vol.Coerce(float),
+            vol.Optional(CONF_LEAD_TIME, default=DEFAULT_LEAD_TIME): vol.Coerce(int),
+            vol.Optional(
+                CONF_MAXIMUM_DURATION, default=DEFAULT_MAXIMUM_DURATION
+            ): vol.Coerce(int),
+        }
+    ),
+    _zone_has_rate_source,
 )
 
 CONFIG_SCHEMA = vol.Schema(
@@ -139,8 +158,9 @@ def _parse_config(hass: HomeAssistant, conf: ConfigType) -> dict:
             calc=ZoneCalcConfig(
                 latitude=latitude,
                 elevation=elevation,
-                area=zone_conf[CONF_AREA],
-                throughput=zone_conf[CONF_THROUGHPUT],
+                area=zone_conf.get(CONF_AREA),
+                throughput=zone_conf.get(CONF_THROUGHPUT),
+                precipitation_rate=zone_conf.get(CONF_PRECIPITATION_RATE),
                 crop_coefficient=zone_conf[CONF_CROP_COEFFICIENT],
                 maximum_deficit=zone_conf[CONF_MAXIMUM_DEFICIT],
                 multiplier=zone_conf[CONF_MULTIPLIER],

@@ -263,3 +263,34 @@ def test_compute_zone_hourly_rain_cancels_et():
     res = compute_zone_hourly(hours, cfg)
     assert res.deficit == 0.0
     assert res.duration == 0
+
+
+# --- Application rate: precipitation_rate vs area+throughput ----------------
+
+def test_rate_from_area_throughput():
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, area=30.0, throughput=10.0)
+    assert cfg.rate_mm_h == 10.0 * 60 / 30.0  # 20 mm/h
+
+
+def test_rate_from_precipitation_rate_direct():
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, precipitation_rate=12.0)
+    assert cfg.rate_mm_h == 12.0
+
+
+def test_precipitation_rate_takes_priority_over_area_throughput():
+    cfg = ZoneCalcConfig(
+        latitude=45, elevation=160, area=30.0, throughput=10.0, precipitation_rate=12.0
+    )
+    assert cfg.rate_mm_h == 12.0
+
+
+def test_rate_zero_when_no_source():
+    cfg = ZoneCalcConfig(latitude=45, elevation=160)
+    assert cfg.rate_mm_h == 0.0
+    assert duration_seconds(5.0, cfg) == 0  # no rate -> no run
+
+
+def test_duration_uses_precipitation_rate():
+    # 24 mm/h direct, deficit 6 mm -> 6/24*3600 = 900 s
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, precipitation_rate=24.0)
+    assert duration_seconds(6.0, cfg) == 900

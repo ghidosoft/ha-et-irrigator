@@ -71,8 +71,10 @@ et_irrigator:
     rain: sensor.ws_rain_total              # total_increasing
   zones:
     - name: Lawn
+      # Application rate: EITHER precipitation_rate, OR area + throughput.
       area: 50                  # m²
       throughput: 12            # L/min delivered to the zone
+      # precipitation_rate: 14  # mm/h measured directly (alternative; takes priority)
       crop_coefficient: 1.0     # Kc (optional)
       irrigation_sensor: binary_sensor.iu_zone_lawn   # on while watering
       max_window_days: 7        # safety cap if never irrigated
@@ -84,6 +86,18 @@ et_irrigator:
 
 All weather channels except `temperature` are optional, but **solar radiation is
 strongly recommended** — without it the FAO-56 net-radiation term degrades.
+
+**Application rate per zone.** Each zone needs to know how fast it applies water
+(mm/h). Provide it either way:
+
+* **`precipitation_rate`** (mm/h) — the rate directly, e.g. measured with the
+  [catch-cup method](https://en.wikipedia.org/wiki/Irrigation_sprinkler#Uniformity)
+  (cans spread across the zone, run N minutes, average depth ÷ minutes × 60). This
+  is what catch-cups give you, with no conversion. **Takes priority if both given.**
+* **`area`** (m²) + **`throughput`** (L/min) — the rate is derived as
+  `throughput × 60 / area` (1 L over 1 m² = 1 mm).
+
+The run-time only depends on this rate, so the two forms are interchangeable.
 
 ### Sensor units
 

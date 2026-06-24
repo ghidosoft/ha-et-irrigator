@@ -137,6 +137,7 @@ class ETIrrigatorCoordinator(DataUpdateCoordinator[dict[str, dict]]):
             "last_calculated": now.isoformat(),
             "size": zone.calc.area,
             "throughput": zone.calc.throughput,
+            "rate": round(zone.calc.rate_mm_h, 3),
             "crop_coefficient": zone.calc.crop_coefficient,
             "multiplier": zone.calc.multiplier,
             "lead_time": zone.calc.lead_time,

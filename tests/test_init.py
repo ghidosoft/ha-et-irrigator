@@ -223,3 +223,31 @@ async def test_reload_adds_and_removes_zones_without_restart(
     await hass.async_block_till_done()
     assert hass.states.get("sensor.et_irrigator_prato") is None
     assert hass.states.get("sensor.et_irrigator_giardino") is not None
+
+
+def test_schema_accepts_precipitation_rate_zone():
+    from custom_components.et_irrigator import CONFIG_SCHEMA
+
+    cfg = CONFIG_SCHEMA(
+        {
+            DOMAIN: {
+                **CONFIG[DOMAIN],
+                "zones": [
+                    {"name": "Rate Zone", "precipitation_rate": 12, "crop_coefficient": 0.8}
+                ],
+            }
+        }
+    )
+    assert cfg[DOMAIN]["zones"][0]["precipitation_rate"] == 12.0
+
+
+def test_schema_rejects_zone_without_rate_source():
+    import voluptuous as vol
+    from custom_components.et_irrigator import CONFIG_SCHEMA
+
+    bad = {DOMAIN: {**CONFIG[DOMAIN], "zones": [{"name": "No Rate"}]}}
+    try:
+        CONFIG_SCHEMA(bad)
+        assert False, "expected validation to fail"
+    except vol.Invalid:
+        pass

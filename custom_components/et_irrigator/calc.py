@@ -59,17 +59,32 @@ class DayData:
 
 @dataclass
 class ZoneCalcConfig:
-    """Static parameters needed to turn a water deficit into a run-time."""
+    """Static parameters needed to turn a water deficit into a run-time.
+
+    The application rate [mm/h] is either given directly as
+    ``precipitation_rate`` (e.g. measured with catch-cups) or derived from
+    ``area`` + ``throughput``. ``precipitation_rate`` takes priority.
+    """
 
     latitude: float  # degrees
     elevation: float  # metres
-    area: float  # m2
-    throughput: float  # L/min
+    area: float | None = None  # m2
+    throughput: float | None = None  # L/min
+    precipitation_rate: float | None = None  # mm/h (overrides area+throughput)
     crop_coefficient: float = 1.0
     maximum_deficit: float = 30.0  # mm (field capacity cap)
     multiplier: float = 1.0
     lead_time: int = 0  # seconds
     maximum_duration: int = -1  # seconds, -1 = no cap
+
+    @property
+    def rate_mm_h(self) -> float:
+        """Effective application rate [mm/h] — direct, else throughput/area."""
+        if self.precipitation_rate is not None:
+            return self.precipitation_rate
+        if self.area and self.throughput:
+            return self.throughput * 60.0 / self.area
+        return 0.0
 
 
 @dataclass
@@ -143,13 +158,13 @@ def eto_fao56_day(day: DayData, latitude: float, elevation: float) -> float:
 def duration_seconds(deficit: float, cfg: ZoneCalcConfig) -> int:
     """Convert a water deficit [mm] into an irrigation run-time [seconds].
 
-    duration = |deficit| / precipitation_rate * 3600, where
-    precipitation_rate [mm/h] = throughput[L/min] * 60 / area[m2]
-    (1 L applied over 1 m2 == 1 mm). Mirrors Smart Irrigation's formula.
+    duration = |deficit| / rate * 3600, where the application rate [mm/h] is
+    ``cfg.rate_mm_h`` (given directly, or throughput[L/min] * 60 / area[m2];
+    1 L applied over 1 m2 == 1 mm). Mirrors Smart Irrigation's formula.
     """
-    if deficit <= 0 or cfg.throughput <= 0 or cfg.area <= 0:
+    rate_mm_h = cfg.rate_mm_h
+    if deficit <= 0 or rate_mm_h <= 0:
         return 0
-    rate_mm_h = cfg.throughput * 60.0 / cfg.area
     seconds = deficit / rate_mm_h * 3600.0
     seconds *= cfg.multiplier
     if cfg.maximum_duration >= 0:
@@ -175,8 +190,7 @@ def _balance_result(
 
     explanation = (
         f"window={window_label} ETo*Kc={eto_crop:.2f}mm precip={precip_total:.2f}mm "
-        f"deficit={deficit:.2f}mm rate="
-        f"{(cfg.throughput * 60.0 / cfg.area) if cfg.area else 0:.2f}mm/h "
+        f"deficit={deficit:.2f}mm rate={cfg.rate_mm_h:.2f}mm/h "
         f"-> {duration}s"
     )
     return ZoneResult(

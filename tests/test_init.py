@@ -179,3 +179,47 @@ async def test_recalculate_service_is_idempotent_and_reflects_new_data(
     await hass.services.async_call(DOMAIN, SERVICE_RECALCULATE, {}, blocking=True)
     await hass.async_block_till_done()
     assert int(hass.states.get(ENTITY).state) > int(first)
+
+
+async def test_reload_adds_and_removes_zones_without_restart(
+    recorder_mock, hass, enable_et_irrigator, patch_data, monkeypatch
+):
+    """et_irrigator.reload applies YAML zone changes with no restart."""
+    from custom_components.et_irrigator import CONFIG_SCHEMA
+
+    assert await async_setup_component(hass, DOMAIN, CONFIG)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.et_irrigator_prato") is not None
+    assert hass.states.get("sensor.et_irrigator_giardino") is None
+
+    def cfg(zones):
+        return CONFIG_SCHEMA({DOMAIN: {**CONFIG[DOMAIN], "zones": zones}})
+
+    prato = CONFIG[DOMAIN]["zones"][0]
+    giardino = {
+        "name": "Giardino",
+        "area": 40,
+        "throughput": 10,
+        "irrigation_sensor": "binary_sensor.iu2",
+    }
+    holder = {"cfg": cfg([prato, giardino])}
+
+    async def fake_yaml(hass, domain, **kwargs):
+        return holder["cfg"]
+
+    monkeypatch.setattr(
+        "custom_components.et_irrigator.async_integration_yaml_config", fake_yaml
+    )
+
+    # Reload -> Giardino added, Prato kept.
+    await hass.services.async_call(DOMAIN, "reload", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.et_irrigator_prato") is not None
+    assert hass.states.get("sensor.et_irrigator_giardino") is not None
+
+    # Reload with only Giardino -> Prato removed.
+    holder["cfg"] = cfg([giardino])
+    await hass.services.async_call(DOMAIN, "reload", {}, blocking=True)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.et_irrigator_prato") is None
+    assert hass.states.get("sensor.et_irrigator_giardino") is not None

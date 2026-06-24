@@ -3,3 +3,10 @@ recalculate:
   description: >-
     Force an immediate rolling-window recalculation of every zone from the
     current long-term statistics. Idempotent — safe to call any time.
+
+reload:
+  name: Reload
+  description: >-
+    Reload the ET Irrigator YAML configuration without restarting Home
+    Assistant. Applies changes to zones and sensors (config only — code changes
+    still require a restart).

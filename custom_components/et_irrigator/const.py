@@ -49,6 +49,7 @@ ALBEDO: Final = 0.23  # FAO-56 reference grass
 
 # --- Services --------------------------------------------------------------
 SERVICE_RECALCULATE: Final = "recalculate"
+SERVICE_RELOAD: Final = "reload"
 
 # --- Coordinator data attribute keys (sensor state attributes) -------------
 ATTR_DEFICIT: Final = "deficit"

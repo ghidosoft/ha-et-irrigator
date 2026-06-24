@@ -142,6 +142,10 @@ under variable conditions).
 ## Services
 
 * `et_irrigator.recalculate` — force an immediate recompute of all zones. Idempotent.
+* `et_irrigator.reload` — re-read the YAML config and apply zone/sensor changes
+  **without restarting** Home Assistant (also appears in *Developer Tools → YAML*
+  and `homeassistant.reload_all`). Note: this reloads **configuration** only —
+  changes to the integration's Python code still need a Home Assistant restart.
 
 ## Development
 

@@ -9,6 +9,8 @@ import voluptuous as vol
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers.reload import async_integration_yaml_config
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.typing import ConfigType
 
 from .calc import ZoneCalcConfig
@@ -45,8 +47,10 @@ from .const import (
     ET_METHOD_DAILY,
     ET_METHOD_HOURLY,
     SERVICE_RECALCULATE,
+    SERVICE_RELOAD,
 )
 from .coordinator import ETIrrigatorCoordinator, ZoneConfig
+from .sensor import async_reload_entities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,13 +117,10 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up ET Irrigator from YAML."""
-    conf = config[DOMAIN]
-
+def _parse_config(hass: HomeAssistant, conf: ConfigType) -> dict:
+    """Turn the validated ``et_irrigator`` block into coordinator kwargs."""
     latitude = hass.config.latitude
     elevation = conf.get(CONF_ELEVATION, hass.config.elevation)
-    wind_height = conf[CONF_WIND_MEASUREMENT_HEIGHT]
 
     sensors_conf = conf[CONF_SENSORS]
     sensors = {
@@ -130,35 +131,38 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         "rain": sensors_conf.get(CONF_RAIN),
     }
 
-    zones: list[ZoneConfig] = []
-    for zone_conf in conf[CONF_ZONES]:
-        zones.append(
-            ZoneConfig(
-                name=zone_conf[CONF_NAME],
-                irrigation_sensor=zone_conf.get(CONF_IRRIGATION_SENSOR),
-                max_window_days=zone_conf[CONF_MAX_WINDOW_DAYS],
-                calc=ZoneCalcConfig(
-                    latitude=latitude,
-                    elevation=elevation,
-                    area=zone_conf[CONF_AREA],
-                    throughput=zone_conf[CONF_THROUGHPUT],
-                    crop_coefficient=zone_conf[CONF_CROP_COEFFICIENT],
-                    maximum_deficit=zone_conf[CONF_MAXIMUM_DEFICIT],
-                    multiplier=zone_conf[CONF_MULTIPLIER],
-                    lead_time=zone_conf[CONF_LEAD_TIME],
-                    maximum_duration=zone_conf[CONF_MAXIMUM_DURATION],
-                ),
-            )
+    zones = [
+        ZoneConfig(
+            name=zone_conf[CONF_NAME],
+            irrigation_sensor=zone_conf.get(CONF_IRRIGATION_SENSOR),
+            max_window_days=zone_conf[CONF_MAX_WINDOW_DAYS],
+            calc=ZoneCalcConfig(
+                latitude=latitude,
+                elevation=elevation,
+                area=zone_conf[CONF_AREA],
+                throughput=zone_conf[CONF_THROUGHPUT],
+                crop_coefficient=zone_conf[CONF_CROP_COEFFICIENT],
+                maximum_deficit=zone_conf[CONF_MAXIMUM_DEFICIT],
+                multiplier=zone_conf[CONF_MULTIPLIER],
+                lead_time=zone_conf[CONF_LEAD_TIME],
+                maximum_duration=zone_conf[CONF_MAXIMUM_DURATION],
+            ),
         )
+        for zone_conf in conf[CONF_ZONES]
+    ]
 
-    coordinator = ETIrrigatorCoordinator(
-        hass,
-        sensors=sensors,
-        wind_height=wind_height,
-        zones=zones,
-        et_method=conf[CONF_ET_METHOD],
-        longitude=hass.config.longitude,
-    )
+    return {
+        "sensors": sensors,
+        "wind_height": conf[CONF_WIND_MEASUREMENT_HEIGHT],
+        "zones": zones,
+        "et_method": conf[CONF_ET_METHOD],
+        "longitude": hass.config.longitude,
+    }
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up ET Irrigator from YAML."""
+    coordinator = ETIrrigatorCoordinator(hass, **_parse_config(hass, config[DOMAIN]))
     hass.data[DOMAIN] = coordinator
 
     await coordinator.async_refresh()
@@ -175,8 +179,24 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         # Manual trigger: force an immediate (non-debounced) recompute.
         await coordinator.async_refresh()
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_RECALCULATE, _handle_recalculate
+    hass.services.async_register(DOMAIN, SERVICE_RECALCULATE, _handle_recalculate)
+
+    async def _handle_reload(_call: ServiceCall) -> None:
+        # Re-read the YAML and apply it without a restart (config only, not code).
+        reloaded = await async_integration_yaml_config(hass, DOMAIN)
+        if not reloaded or DOMAIN not in reloaded:
+            _LOGGER.warning(
+                "ET Irrigator: reload found no valid configuration; keeping current"
+            )
+            return
+        coordinator.update_config(**_parse_config(hass, reloaded[DOMAIN]))
+        await async_reload_entities(hass)
+        await coordinator.async_refresh()
+
+    # Registered as `<domain>.reload` so it appears in the standard
+    # Developer Tools -> YAML reload list and homeassistant.reload_all.
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_RELOAD, _handle_reload, schema=vol.Schema({})
     )
 
     hass.async_create_task(

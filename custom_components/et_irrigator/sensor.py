@@ -9,6 +9,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -34,6 +35,10 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import ETIrrigatorCoordinator
+
+# hass.data key holding the platform's add-callback and current entities, so a
+# YAML reload can reconcile zone entities without a restart.
+DATA_SENSOR_STORE = f"{DOMAIN}_sensor_store"
 
 # Keys copied verbatim from coordinator data into the sensor's attributes.
 _ATTR_KEYS = (
@@ -64,10 +69,46 @@ async def async_setup_platform(
 ) -> None:
     """Set up the zone sensors from the coordinator."""
     coordinator: ETIrrigatorCoordinator = hass.data[DOMAIN]
-    async_add_entities(
-        ETIrrigatorZoneSensor(coordinator, zone.key, zone.name)
+    entities = {
+        zone.key: ETIrrigatorZoneSensor(coordinator, zone.key, zone.name)
         for zone in coordinator.zones
-    )
+    }
+    async_add_entities(entities.values())
+    hass.data[DATA_SENSOR_STORE] = {"add": async_add_entities, "entities": entities}
+
+
+async def async_reload_entities(hass: HomeAssistant) -> None:
+    """Reconcile zone entities against the (already-reloaded) coordinator.
+
+    The coordinator object is reused, so existing entities for unchanged zones
+    keep working; only removed zones are dropped and new zones are added.
+    """
+    store = hass.data.get(DATA_SENSOR_STORE)
+    if not store:
+        return
+    coordinator: ETIrrigatorCoordinator = hass.data[DOMAIN]
+    current: dict = store["entities"]
+    new_zones = {zone.key: zone for zone in coordinator.zones}
+
+    registry = er.async_get(hass)
+    for key in list(current):
+        if key not in new_zones:
+            entity = current.pop(key)
+            entity_id = entity.entity_id
+            await entity.async_remove()
+            # Purge the registry entry too, so a dropped zone disappears instead
+            # of lingering as a restored `unavailable` state.
+            if registry.async_get(entity_id):
+                registry.async_remove(entity_id)
+
+    to_add = [
+        ETIrrigatorZoneSensor(coordinator, zone.key, zone.name)
+        for key, zone in new_zones.items()
+        if key not in current
+    ]
+    if to_add:
+        store["add"](to_add)
+        current.update({entity.zone_key: entity for entity in to_add})
 
 
 class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEntity):
@@ -95,6 +136,10 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
             name="ET Irrigator",
             manufacturer="ET Irrigator",
         )
+
+    @property
+    def zone_key(self) -> str:
+        return self._zone_key
 
     @property
     def _zone_data(self) -> dict | None:

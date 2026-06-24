@@ -63,6 +63,26 @@ class ETIrrigatorCoordinator(DataUpdateCoordinator[dict[str, dict]]):
         self.et_method = et_method
         self.longitude = longitude
 
+    def update_config(
+        self,
+        *,
+        sensors: dict[str, str | None],
+        wind_height: float,
+        zones: list[ZoneConfig],
+        et_method: str,
+        longitude: float,
+    ) -> None:
+        """Replace the config in place (for a YAML reload without restart).
+
+        Mutating the existing coordinator keeps already-created entities bound to
+        it; the caller reconciles added/removed zones and triggers a refresh.
+        """
+        self.sensors = sensors
+        self.wind_height = wind_height
+        self.zones = zones
+        self.et_method = et_method
+        self.longitude = longitude
+
     @property
     def weather_ids(self) -> set[str]:
         return {eid for eid in self.sensors.values() if eid}

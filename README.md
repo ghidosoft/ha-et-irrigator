@@ -147,6 +147,26 @@ under variable conditions).
   and `homeassistant.reload_all`). Note: this reloads **configuration** only —
   changes to the integration's Python code still need a Home Assistant restart.
 
+## Design notes (architecture choices)
+
+**YAML-only, no config flow (deliberate, for now).** This integration configures
+via `async_setup` + a YAML block, not Home Assistant's recommended UI config flow
+/ config entries. That's a conscious trade-off, not an oversight:
+
+* What we give up: a *Settings → Devices & Services* card, an options flow (editing
+  from the UI), config-entry features (diagnostics, repairs, reauth), and
+  eligibility for **HA core** (core mandates config flow — HACS does not).
+* What we keep: entity `unique_id`s + device registry (renameable, customizable
+  entities), read-only recorder access via the recorder executor, and correct
+  `state_class`/`device_class` for statistics. The deviations are about the
+  *management surface*, not the calculation engine.
+* Config changes apply without a restart via `et_irrigator.reload` (the standard
+  reload helpers target the legacy `sensor: - platform:` style and don't fit this
+  hub + discovery integration, so the reload is implemented manually).
+* Migration path stays open: a config flow can be added *alongside* YAML later
+  (import pattern), reusing `calc.py` / `coordinator.py` unchanged — they are
+  decoupled from how the config arrives.
+
 ## Development
 
 ```bash

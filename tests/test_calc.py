@@ -13,6 +13,7 @@ from custom_components.et_irrigator.calc import (
     eto_fao56_day,
     eto_fao56_hourly,
     ra_hourly,
+    run_water_balance,
 )
 
 
@@ -134,6 +135,26 @@ def test_compute_zone_rain_cancels_et():
     assert res.deficit == 0.0
     assert res.duration == 0
     assert res.delta > 0  # surplus
+    assert res.net_deficit < 0  # same number, deficit sign convention
+    assert res.drainage > 0  # the surplus left the root zone, it was not banked
+
+
+def test_rain_beyond_capacity_is_drained_not_banked():
+    """The reported bug, at its root: surplus rain must not pay for later ET.
+
+    Old model: sum(rain) - sum(ET*Kc) over the window, so 100 mm of rain silently
+    cancelled every subsequent dry day until it scrolled out of the window. The
+    bucket drains it the day it falls, so the very next dry day shows a deficit.
+    """
+    cfg = ZoneCalcConfig(latitude=45, elevation=250, area=50.0, throughput=12.0)
+    wet_then_dry = compute_zone([_summer_day(precipitation_mm=100.0), _summer_day()], cfg)
+    dry_only = compute_zone([_summer_day()], cfg)
+
+    assert wet_then_dry.deficit > 0
+    assert wet_then_dry.duration > 0
+    # The dry day's ET is charged in full: the 100 mm bought nothing beyond its day.
+    assert math.isclose(wet_then_dry.deficit, dry_only.deficit, rel_tol=1e-6)
+    assert wet_then_dry.drainage > 90.0
 
 
 def test_compute_zone_accumulates_multi_day_deficit():
@@ -151,6 +172,94 @@ def test_compute_zone_deficit_capped_at_field_capacity():
     days = [_summer_day() for _ in range(10)]  # huge ET
     res = compute_zone(days, cfg)
     assert res.deficit == 5.0
+    # The ET the ceiling refused to account for: a chronic under-watering signal.
+    assert res.capped > 0
+
+
+# --- The water balance itself -----------------------------------------------
+
+def test_water_balance_unclamped_matches_plain_sum():
+    """With an unreachable ceiling, depletion == net_deficit + drainage exactly."""
+    wb = run_water_balance(
+        [2.0, 3.0, 1.0, 4.0], [0.0, 10.0, 0.0, 0.0], taw=1e9
+    )
+    assert math.isclose(wb.depletion, wb.net_deficit + wb.drainage)
+    assert math.isclose(wb.net_deficit, sum([2.0, 3.0, 1.0, 4.0]) - 10.0)
+
+
+def test_water_balance_stays_within_bounds():
+    etc = [0.0, 5.0, 0.3, 9.0, 0.0, 2.5, 7.0, 0.1]
+    rain = [12.0, 0.0, 0.0, 3.0, 40.0, 0.0, 0.0, 1.0]
+    for taw in (1.0, 6.0, 30.0):
+        wb = run_water_balance(etc, rain, taw=taw)
+        assert 0.0 <= wb.depletion <= taw
+
+
+def test_water_balance_conserves_water():
+    """Every mm of rain is either infiltrated or run off; ET is fully accounted."""
+    etc = [1.0, 2.0, 0.5]
+    rain = [30.0, 0.0, 4.0]
+    wb = run_water_balance(etc, rain, taw=10.0, max_infiltration_rate=8.0)
+    assert math.isclose(wb.precipitation, sum(rain))
+    assert math.isclose(wb.infiltration + wb.runoff, wb.precipitation)
+    assert math.isclose(wb.evapotranspiration, sum(etc))
+    # depletion = ETc - infiltration + drained + capped
+    assert math.isclose(
+        wb.depletion,
+        wb.evapotranspiration - wb.infiltration + wb.drainage + wb.capped,
+    )
+
+
+def test_infiltration_rate_cap_creates_runoff():
+    wb = run_water_balance([0.0], [30.0], taw=100.0, max_infiltration_rate=10.0)
+    assert wb.precipitation == 30.0
+    assert wb.infiltration == 10.0
+    assert wb.runoff == 20.0
+
+
+def test_infiltration_cap_is_a_noop_on_light_rain():
+    """Unlike a flat efficiency factor, the cap must not touch a gentle drizzle."""
+    wb = run_water_balance([0.0], [2.0], taw=100.0, max_infiltration_rate=10.0)
+    assert wb.infiltration == 2.0
+    assert wb.runoff == 0.0
+
+
+def test_infiltration_cap_scales_with_step_length():
+    """A daily step gets 24h worth of infiltration allowance, not 1h."""
+    hourly = run_water_balance([0.0], [30.0], taw=100.0, max_infiltration_rate=10.0)
+    daily = run_water_balance(
+        [0.0], [30.0], taw=100.0, step_hours=24.0, max_infiltration_rate=10.0
+    )
+    assert hourly.runoff == 20.0
+    assert daily.runoff == 0.0
+
+
+def test_net_deficit_sign_convention():
+    """net_deficit is a deficit (positive = dry); delta is its legacy inverse."""
+    cfg = ZoneCalcConfig(latitude=45, elevation=250, area=50.0, throughput=12.0)
+    wet = compute_zone([_summer_day(precipitation_mm=100.0)], cfg)
+    dry = compute_zone([_summer_day()], cfg)
+    assert wet.net_deficit < 0 < dry.net_deficit
+    assert wet.delta == -wet.net_deficit
+    assert dry.delta == -dry.net_deficit
+
+
+def test_eto_is_zero_when_temperature_is_missing():
+    """A recorder gap must cost ET, never the hour's rain."""
+    assert eto_fao56_day(_summer_day(t_min=None, t_max=None), 45.0, 250.0) == 0.0
+    assert eto_fao56_hourly(_solar_hour(12.5, t=None), 45.0, 250.0) == 0.0
+
+
+def test_rain_survives_a_missing_temperature_step():
+    cfg = ZoneCalcConfig(latitude=45, elevation=250, area=50.0, throughput=12.0)
+    gap = DayData(
+        day_of_year=196, t_min=None, t_max=None, solar_rad_mj=0.0,
+        wind_speed=2.0, precipitation_mm=8.0,
+    )
+    res = compute_zone([_summer_day(), gap], cfg)
+    assert res.precipitation == 8.0
+    assert res.infiltration == 8.0
+    assert res.deficit == 0.0  # 8 mm covers the one summer day's ET
 
 
 def test_compute_zone_is_idempotent():
@@ -256,13 +365,51 @@ def test_hourly_deficit_is_monotonic():
         prev = d
 
 
-def test_compute_zone_hourly_rain_cancels_et():
+def test_compute_zone_hourly_rain_refills_then_et_resumes():
+    """50 mm at noon fills the soil; the afternoon's ET starts drying it again.
+
+    Under the old sum-then-clamp model this returned deficit 0 for the whole day
+    (and for every day after, until the rain hour scrolled out of the window).
+    """
     cfg = ZoneCalcConfig(latitude=45, elevation=160, area=50.0, throughput=12.0)
     hours = _synthetic_day_hours()
     hours[12] = HourData(**{**hours[12].__dict__, "precipitation_mm": 50.0})
     res = compute_zone_hourly(hours, cfg)
-    assert res.deficit == 0.0
-    assert res.duration == 0
+
+    afternoon_et = sum(eto_fao56_hourly(h, 45.0, 160.0) for h in hours[13:])
+    assert math.isclose(res.deficit, afternoon_et, abs_tol=1e-3)  # deficit is rounded
+    assert res.duration > 0
+    assert res.drainage > 40.0
+
+
+def test_no_cliff_when_rain_leaves_the_window():
+    """Regression test for the reported bug: no step change as the window slides.
+
+    Old model: while a big rain event sat inside the window it cancelled the whole
+    window's ET (deficit 0); the hour it scrolled out, the deficit jumped straight
+    to `maximum_deficit`. With per-step clamping, dropping the oldest hour can only
+    move the answer by that hour's net drying, because every step is monotone and
+    1-Lipschitz and composition preserves both.
+    """
+    cfg = ZoneCalcConfig(
+        latitude=45, elevation=160, area=50.0, throughput=12.0, maximum_deficit=30.0
+    )
+    hours: list[HourData] = []
+    for _ in range(7):  # a 7-day window, like the default max_window_days
+        hours.extend(_synthetic_day_hours())
+    hours[2 * 24 + 15] = HourData(
+        **{**hours[2 * 24 + 15].__dict__, "precipitation_mm": 35.0}
+    )
+
+    max_hourly_etc = max(eto_fao56_hourly(h, 45.0, 160.0) for h in hours)
+    deficits = [compute_zone_hourly(hours[k:], cfg).deficit for k in range(len(hours))]
+    steps = [abs(b - a) for a, b in zip(deficits, deficits[1:])]
+
+    # +1e-3 covers the 3-decimal rounding of the two published deficits.
+    assert max(steps) <= max_hourly_etc + 1e-3
+    # Sanity: the scenario really does exercise a full dry-down, so a cliff would
+    # have had somewhere to fall from.
+    assert max(deficits) > 20.0
 
 
 # --- Application rate: precipitation_rate vs area+throughput ----------------

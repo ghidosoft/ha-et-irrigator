@@ -11,12 +11,17 @@ engineering is different:
 
 * **Recompute, never accumulate.** Smart Irrigation keeps a mutable *bucket* float
   that is mutated every run and can only be reset through a service call. ET
-  Irrigator instead **recomputes the whole water balance from statistics on every
-  run**, so the result is a pure function of recorded data — **idempotent and
-  non-destructive**. Run it as many times as you like.
-* **Rolling window since the last irrigation.** The deficit is integrated over
+  Irrigator runs a real FAO-56 soil-water bucket too — but **reconstructs it from
+  statistics on every run** instead of persisting it. Same physics, and the result
+  stays a pure function of recorded data: **idempotent and non-destructive**. Run
+  it as many times as you like; there is no state to corrupt and nothing to reset.
+* **A soil bucket, clamped every step.** Rain that lands on already-full soil
+  drains away *in the hour it falls*, instead of being banked and silently
+  cancelling the next week's evapotranspiration. This is the difference between a
+  deficit curve that ramps and one that sits at zero and then jumps to its cap.
+* **Rolling window since the last irrigation.** The balance is reconstructed over
   `[last watering → now]`. When your irrigation actually runs (detected from the
-  zone's `irrigation_sensor`), the window resets — no stale bucket.
+  zone's `irrigation_sensor`), the window resets.
 * **Hourly, on real data.** It recomputes the moment Home Assistant commits a new
   hour of long-term statistics (`recorder_hourly_statistics_generated`), not once a
   day on a forecast.
@@ -33,19 +38,46 @@ For each zone, on every recompute:
 2. Read hourly long-term statistics for your weather sensors over
    `[reference → now]`.
 3. Compute reference ET (FAO-56 Penman-Monteith, using your **measured solar
-   radiation**) over the window and multiply by the crop coefficient `Kc`. By
-   default this is the **hourly** equation (FAO-56 Eq. 53) summed per hour — see
-   *ET method* below — or the daily equation per calendar day.
-4. `deficit = clamp(ΣET·Kc − Σrain, 0, maximum_deficit)`.
-5. `duration = deficit / rate × 3600`, where
+   radiation**) for each step and multiply by the crop coefficient `Kc`. By
+   default the step is one **hour** (FAO-56 Eq. 53) — see *ET method* below — or
+   one calendar day for the daily equation.
+4. Walk the steps in order, keeping a soil **depletion** (mm below field
+   capacity), starting at 0 and clamped at **every** step:
+
+   ```
+   infiltration = min(rain, max_infiltration_rate)      # excess = runoff
+   depletion   += ETc − infiltration
+   depletion    = clamp(depletion, 0, maximum_deficit)  # excess below 0 = drainage
+   ```
+
+5. `duration = depletion / rate × 3600`, where
    `rate [mm/h] = throughput [L/min] × 60 / area [m²]`, then apply `multiplier`,
    `maximum_duration` and `lead_time`.
 
 The recommended run-time (seconds) is published as `sensor.et_irrigator_<zone>`,
 with a Smart-Irrigation-compatible set of attributes (`deficit`, `delta`,
-`evapotranspiration`, `precipitation`, `size`, `throughput`, …). Feed that into
-your irrigation automation (e.g. Irrigation Unlimited) exactly as you would feed
-Smart Irrigation's `duration`.
+`evapotranspiration`, `precipitation`, `size`, `throughput`, …), plus diagnostic
+sensors for the balance itself — see *Entities* below. Feed the run-time into your
+irrigation automation (e.g. Irrigation Unlimited) exactly as you would feed Smart
+Irrigation's `duration`.
+
+### Why clamping every step matters
+
+Summing first and clamping once — `clamp(ΣET·Kc − Σrain, 0, max)` — looks
+equivalent and is not. A 35 mm storm stays *inside* the rolling window for the
+whole `max_window_days`, retroactively paying for every dry day after it; the hour
+it scrolls out, the deficit jumps straight from 0 to `maximum_deficit`. Real soil
+does not work that way: it fills, and the rest runs off or percolates past the
+roots the same day.
+
+Clamping per step also makes the reconstruction *stable*. Each step is
+`f(d) = clamp(d + ETc − infiltration, 0, TAW)`, which is monotone and 1-Lipschitz,
+and composing such functions preserves both. So sliding the window by one hour can
+move the answer by at most **that hour's net drying** (a fraction of a mm), never
+by the rain it contained. And the memory of the `depletion = 0` starting
+assumption is erased *entirely* the first time a later step hits a clamp — which
+any soil-filling rain does. That is why no state needs to be persisted for the
+result to be well-behaved.
 
 ## Installation
 
@@ -78,7 +110,8 @@ et_irrigator:
       crop_coefficient: 1.0     # Kc (optional)
       irrigation_sensor: binary_sensor.iu_zone_lawn   # on while watering
       max_window_days: 7        # safety cap if never irrigated
-      maximum_deficit: 30       # mm, field-capacity cap
+      maximum_deficit: 30       # mm, TAW: what the root zone can hold
+      max_infiltration_rate: 15 # mm/h; rain faster than this runs off (optional)
       multiplier: 1.0           # optional fudge factor
       lead_time: 0              # seconds added to every run
       maximum_duration: -1      # seconds, -1 = no cap
@@ -127,10 +160,11 @@ radiation and rain are read natively and must already be in `W/m²` and `mm`.
 ### ET method (`et_method`)
 
 * **`hourly`** (default) — FAO-56 hourly Penman-Monteith (Eq. 53) computed for
-  each hour and summed over the window. Matches the hourly granularity of the
-  data: the window edges (e.g. an irrigation at 05:30) are exact rather than a
-  partial-day approximation, and the integrated deficit is **monotonic** between
-  irrigations (no day-aggregate revision wobble). Recommended.
+  each hour, and the water balance stepped hour by hour. Matches the hourly
+  granularity of the data: the window edges (e.g. an irrigation at 05:30) are exact
+  rather than a partial-day approximation, rain is drained against the soil state of
+  the hour it actually fell in, and the deficit is **monotonic** through dry spells
+  (no day-aggregate revision wobble). Recommended.
 * **`daily`** — FAO-56 daily Penman-Monteith (Eq. 6) per calendar day. Slightly
   cheaper, kept mainly for A/B comparison; the in-progress day's estimate is
   revised as new hours arrive, so the duration can wobble a few seconds.
@@ -139,19 +173,95 @@ Both use your measured solar radiation. Over full days they agree within a few
 percent (hourly-summed is typically a touch lower and is considered more accurate
 under variable conditions).
 
-## Limitations (v1, by design)
+## Entities
 
-* **Window start assumes field capacity.** The deficit is integrated from the end
-  of the last irrigation, taking the soil as full (deficit 0) at that point — true
-  right after watering. In the fallback case (no irrigation within
-  `max_window_days`), it assumes field capacity that many days ago, which is a
-  guess; the `maximum_deficit` cap bounds the error, but after a long dry spell the
-  deficit can be **under-estimated**.
+Each zone publishes one **run-time** sensor plus a set of **diagnostic** sensors
+in mm/%. The diagnostics exist because state *attributes* get no long-term
+statistics: to graph the deficit in Home Assistant's native History/Statistics
+cards it has to be a state, not an attribute. They all carry
+`state_class: measurement` (which is what makes the recorder keep them) and
+`entity_category: diagnostic` (which keeps them off the auto-generated dashboard).
+
+| Entity | Unit | Meaning |
+| --- | --- | --- |
+| `sensor.et_irrigator_<zone>` | s | **Recommended run-time.** Carries the full attribute set. |
+| `…_deficit` | mm | Soil depletion, `0 … maximum_deficit`. The curve to watch. |
+| `…_net_deficit` | mm | **Signed**, unclamped: positive = dry, **negative = surplus**. |
+| `…_soil_moisture` | % | `100 × (1 − deficit / maximum_deficit)`. |
+| `…_evapotranspiration` | mm | ETo × Kc summed over the window. |
+| `…_precipitation` | mm | Gauge rain over the window (gross). |
+| `…_rain_lost` | mm | Rain that never reached the roots: drained + run off. |
+
+Sign convention: everything named *deficit* is a deficit, so **positive means the
+soil is dry**. The legacy `delta` attribute is the opposite sign (rain − ET), kept
+unchanged for Smart-Irrigation compatibility; `net_deficit` is simply `−delta`.
+
+**The diagnostic graph.** Plot `deficit` and `net_deficit` on the same axis. Where
+they coincide, the bucket is running freely; where they diverge, a clamp is
+binding — `net_deficit` below zero is surplus being discarded, `deficit` flat at
+`maximum_deficit` is the ceiling. Note that `net_deficit` is a plain window sum, so
+it *does* still step when old data scrolls out of the window: that is what it is
+for (seeing the raw balance), and it is why the run-time is not computed from it.
+
+## Tuning
+
+* **`maximum_deficit` (TAW)** — how much water the root zone holds, in mm. Roughly
+  `root depth (m) × available water capacity (mm/m)`: a lawn at 15 cm in loam is
+  ≈ 0.15 × 130 ≈ 20 mm. Too high and the zone asks for a soaking it can't absorb;
+  too low and `capped` (an attribute) starts accumulating — that number is your
+  chronic-under-watering signal.
+* **`max_infiltration_rate`** — the soil's intake rate in mm/h. The bucket already
+  handles *volume*-driven runoff (rain on full soil), but not *intensity*-driven
+  runoff: 35 mm in two hours mostly runs off even on dry soil. Sandy soils take
+  20-30 mm/h, loam ~10-15, clay under 5. Watch `…_rain_lost` after a storm to
+  calibrate. Leave it unset to count all gauge rain as infiltrating.
+* **Deep, infrequent watering** — this integration publishes a recommended
+  run-time, not a schedule. To water deeply every few days instead of a trickle
+  daily, gate your automation on the deficit, e.g.
+  `{{ state_attr('sensor.et_irrigator_lawn', 'deficit') > 15 }}` (FAO-56 suggests
+  refilling at ~50% of TAW for turf).
+
+## Limitations (by design)
+
+* **Window start assumes field capacity.** The balance starts at depletion 0 at the
+  end of the last irrigation — true right after watering. In the fallback case (no
+  irrigation within `max_window_days`) that is a guess, but a *bounded* one: the
+  per-step clamps erase it as soon as any rain fills the soil or the depletion
+  reaches `maximum_deficit`. See *Why clamping every step matters*.
 * **Solar is integrated from hourly statistics.** Daily radiation is the sum of the
   covered hours' mean irradiance. Recorder gaps at night are harmless (0), but
-  daytime gaps under-count the day's energy and slightly under-estimate ET.
-* **No soil/runoff model beyond the field-capacity cap.** Heavy rain above
-  `maximum_deficit` is treated as run-off; there is no drainage curve.
+  daytime gaps under-count the day's energy and slightly under-estimate ET. An hour
+  with rain statistics but no temperature statistics is kept, with ETo 0 — losing
+  the rain would be the far worse error.
+* **Single-layer bucket.** No root-depth profile, no percolation curve, no capillary
+  rise. Infiltration is capped and everything above field capacity is gone the same
+  step.
+* **No water-stress coefficient (`Ks`).** FAO-56 reduces actual ET once depletion
+  passes the readily-available fraction, so a bucket pinned at `maximum_deficit`
+  slightly over-estimates the real requirement.
+* **Irrigation is a window reset, not a metered input.** Any detected `on` → `off`
+  transition of the `irrigation_sensor` resets the balance to zero regardless of how
+  long it actually ran, so a partial run is credited as a full refill.
+* **The daily method approximates twice.** Rain and ET within the same day net out
+  before the clamp, so drainage is under-counted, and `max_infiltration_rate` is
+  applied as `rate × 24 h` and effectively never binds. Use the default `hourly`.
+* **No rain forecast.** Only recorded history.
+
+## Upgrading from 0.1.x
+
+0.2.0 replaces sum-then-clamp with the per-step soil bucket. Nothing in your YAML
+has to change, but:
+
+* **Expect different — usually larger — deficits right after upgrading**, especially
+  if it rained recently. That is the fix, not a regression: surplus rain is no
+  longer paying for later evapotranspiration.
+* `maximum_deficit` is unchanged in name and default but is now genuinely the soil's
+  holding capacity (TAW), because it is the bucket ceiling rather than a post-hoc
+  cap. It is also now rejected at 0 (which used to silently zero the zone).
+* Six diagnostic entities per zone are new. The run-time sensor keeps its exact
+  `entity_id` and `unique_id`, so existing automations and history are untouched.
+* The `delta` attribute is unchanged; `net_deficit` is its negation, in the deficit
+  sign convention used everywhere else.
 
 ## Services
 

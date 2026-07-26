@@ -33,6 +33,7 @@ CONF_CROP_COEFFICIENT: Final = "crop_coefficient"
 CONF_IRRIGATION_SENSOR: Final = "irrigation_sensor"
 CONF_MAX_WINDOW_DAYS: Final = "max_window_days"
 CONF_MAXIMUM_DEFICIT: Final = "maximum_deficit"
+CONF_MAX_INFILTRATION_RATE: Final = "max_infiltration_rate"
 CONF_MULTIPLIER: Final = "multiplier"
 CONF_LEAD_TIME: Final = "lead_time"
 CONF_MAXIMUM_DURATION: Final = "maximum_duration"
@@ -42,7 +43,8 @@ DEFAULT_WIND_MEASUREMENT_HEIGHT: Final = 2.0  # metres
 DEFAULT_WIND_SPEED: Final = 2.0  # m/s, FAO-56 default when wind data is missing
 DEFAULT_CROP_COEFFICIENT: Final = 1.0
 DEFAULT_MAX_WINDOW_DAYS: Final = 7
-DEFAULT_MAXIMUM_DEFICIT: Final = 30.0  # mm (field capacity cap)
+DEFAULT_MAXIMUM_DEFICIT: Final = 30.0  # mm (TAW: total available water in root zone)
+DEFAULT_MAX_INFILTRATION_RATE: Final = None  # mm/h, None = all gauge rain infiltrates
 DEFAULT_MULTIPLIER: Final = 1.0
 DEFAULT_LEAD_TIME: Final = 0  # seconds
 DEFAULT_MAXIMUM_DURATION: Final = -1  # seconds, -1 = no cap
@@ -54,9 +56,18 @@ SERVICE_RELOAD: Final = "reload"
 
 # --- Coordinator data attribute keys (sensor state attributes) -------------
 ATTR_DEFICIT: Final = "deficit"
+# Deprecated alias of -net_deficit, kept for Smart-Irrigation compatibility.
 ATTR_DELTA: Final = "delta"
+ATTR_NET_DEFICIT: Final = "net_deficit"
 ATTR_EVAPOTRANSPIRATION: Final = "evapotranspiration"
 ATTR_PRECIPITATION: Final = "precipitation"
+ATTR_INFILTRATION: Final = "infiltration"
+ATTR_DRAINAGE: Final = "drainage"
+ATTR_RUNOFF: Final = "runoff"
+ATTR_RAIN_LOST: Final = "rain_lost"  # drainage + runoff
+ATTR_CAPPED: Final = "capped"
+ATTR_SOIL_MOISTURE: Final = "soil_moisture"
+ATTR_MAX_INFILTRATION_RATE: Final = "max_infiltration_rate"
 ATTR_SIZE: Final = "size"
 ATTR_THROUGHPUT: Final = "throughput"
 ATTR_RATE: Final = "rate"  # effective application rate, mm/h

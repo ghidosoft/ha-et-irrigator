@@ -168,3 +168,48 @@ def test_build_hours_wind_defaults_when_missing():
     }
     hours = build_hours(stats, sensors, wind_height=2.0, longitude=10.0)
     assert hours and all(h.wind_speed == DEFAULT_WIND_SPEED for h in hours)
+
+
+def test_build_hours_keeps_rain_only_hours():
+    """A recorder gap in temperature must not swallow that hour's rain.
+
+    The water balance is path dependent: rain dropped here is rain that never
+    reaches the soil in any later step, so the zone over-irrigates forever after.
+    The hour survives with t=None, which costs its ET instead (the safe direction).
+    """
+    base = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    stats = {
+        # temperature only for 12:00 and 14:00 — 13:00 is a gap
+        "sensor.t": [
+            {"start": base, "mean": 25.0},
+            {"start": base + timedelta(hours=2), "mean": 25.0},
+        ],
+        "sensor.r": [{"start": base + timedelta(hours=1), "change": 35.0}],
+    }
+    sensors = {
+        "temperature": "sensor.t",
+        "wind_speed": None,
+        "solar_radiation": None,
+        "dewpoint": None,
+        "rain": "sensor.r",
+    }
+    hours = build_hours(stats, sensors, wind_height=2.0, longitude=10.0)
+
+    assert len(hours) == 3  # 12:00, 13:00 (rain only), 14:00
+    assert hours[1].t is None
+    assert hours[1].precipitation_mm == 35.0
+    assert sum(h.precipitation_mm for h in hours) == 35.0
+
+
+def test_build_days_keeps_rain_only_days():
+    stats = {
+        "sensor.t": _hours("mean", 22.0, day=15),
+        "sensor.r": _hours("change", 4.0, day=16),  # rain on a day with no temperature
+    }
+    days = build_days(stats, _all_sensors(rain="sensor.rain"), wind_height=2.0)
+    assert len(days) == 1  # rain sensor not configured -> only the temperature day
+
+    days = build_days(stats, _all_sensors(rain="sensor.r"), wind_height=2.0)
+    assert len(days) == 2
+    assert days[1].t_min is None and days[1].t_max is None
+    assert abs(days[1].precipitation_mm - 12.0) < 1e-9  # 3 hours * 4.0

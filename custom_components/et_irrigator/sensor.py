@@ -1,13 +1,22 @@
-"""Sensor platform: one duration sensor per irrigation zone."""
+"""Sensor platform: the run-time sensor plus diagnostic sensors, per zone.
+
+Each zone publishes one *primary* sensor — the recommended run-time in seconds,
+carrying the full attribute set — and a handful of **diagnostic** sensors in mm/%
+that expose the water balance itself. The diagnostics exist because state
+attributes get no long-term statistics: to graph the deficit natively in Home
+Assistant it has to be a state, not an attribute.
+"""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfTime
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
@@ -16,20 +25,28 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    ATTR_CAPPED,
     ATTR_CROP_COEFFICIENT,
     ATTR_DEFICIT,
     ATTR_DELTA,
+    ATTR_DRAINAGE,
     ATTR_EVAPOTRANSPIRATION,
     ATTR_EXPLANATION,
+    ATTR_INFILTRATION,
     ATTR_LAST_CALCULATED,
     ATTR_LEAD_TIME,
+    ATTR_MAX_INFILTRATION_RATE,
     ATTR_MAXIMUM_DEFICIT,
     ATTR_MAXIMUM_DURATION,
     ATTR_MULTIPLIER,
+    ATTR_NET_DEFICIT,
     ATTR_NUMBER_OF_DATA_POINTS,
     ATTR_PRECIPITATION,
+    ATTR_RAIN_LOST,
     ATTR_RATE,
+    ATTR_RUNOFF,
     ATTR_SIZE,
+    ATTR_SOIL_MOISTURE,
     ATTR_THROUGHPUT,
     ATTR_WINDOW_END,
     ATTR_WINDOW_START,
@@ -41,12 +58,21 @@ from .coordinator import ETIrrigatorCoordinator
 # YAML reload can reconcile zone entities without a restart.
 DATA_SENSOR_STORE = f"{DOMAIN}_sensor_store"
 
-# Keys copied verbatim from coordinator data into the sensor's attributes.
+UNIT_MM = "mm"
+
+# Keys copied verbatim from coordinator data into the primary sensor's attributes.
 _ATTR_KEYS = (
     ATTR_DEFICIT,
+    ATTR_NET_DEFICIT,
     ATTR_DELTA,
     ATTR_EVAPOTRANSPIRATION,
     ATTR_PRECIPITATION,
+    ATTR_INFILTRATION,
+    ATTR_DRAINAGE,
+    ATTR_RUNOFF,
+    ATTR_RAIN_LOST,
+    ATTR_CAPPED,
+    ATTR_SOIL_MOISTURE,
     ATTR_SIZE,
     ATTR_THROUGHPUT,
     ATTR_RATE,
@@ -59,8 +85,107 @@ _ATTR_KEYS = (
     ATTR_LEAD_TIME,
     ATTR_MAXIMUM_DURATION,
     ATTR_MAXIMUM_DEFICIT,
+    ATTR_MAX_INFILTRATION_RATE,
     ATTR_EXPLANATION,
 )
+
+
+@dataclass(frozen=True)
+class ZoneSensorSpec:
+    """One sensor entity per zone, described declaratively."""
+
+    suffix: str  # "" == the primary run-time sensor
+    label: str  # appended to the zone name; "" for the primary sensor
+    data_key: str  # key to read from the coordinator's per-zone dict
+    unit: str
+    icon: str
+    device_class: SensorDeviceClass | None = None
+    precision: int | None = None
+    diagnostic: bool = True
+    with_attributes: bool = False
+
+
+# Every spec uses state_class MEASUREMENT — that (not entity_category) is what
+# makes Home Assistant record long-term statistics, so the diagnostic sensors are
+# graphable in the native History/Statistics cards.
+#
+# Deliberately NOT TOTAL_INCREASING for the mm sums: they are sums over a *sliding*
+# window, so they fall when old data scrolls out and HA would fabricate resets.
+# Deliberately no SensorDeviceClass.PRECIPITATION either: its unit conversion is
+# meaningless for a soil deficit and ambiguous for a signed value.
+ZONE_SENSORS: tuple[ZoneSensorSpec, ...] = (
+    ZoneSensorSpec(
+        suffix="",
+        label="",
+        data_key="duration",
+        unit=UnitOfTime.SECONDS,
+        icon="mdi:sprinkler-variant",
+        device_class=SensorDeviceClass.DURATION,
+        diagnostic=False,
+        with_attributes=True,
+    ),
+    ZoneSensorSpec(
+        suffix="deficit",
+        label="Deficit",
+        data_key="deficit",
+        unit=UNIT_MM,
+        icon="mdi:water-minus",
+        precision=2,
+    ),
+    ZoneSensorSpec(
+        # Signed: positive = soil dry, negative = surplus rain that was discarded.
+        # This is the unclamped window sum, so it still shows window-edge steps by
+        # construction — it is a diagnostic, not the number to irrigate from.
+        suffix="net_deficit",
+        label="Net deficit",
+        data_key="net_deficit",
+        unit=UNIT_MM,
+        icon="mdi:swap-vertical",
+        precision=2,
+    ),
+    ZoneSensorSpec(
+        suffix="soil_moisture",
+        label="Soil moisture",
+        data_key="soil_moisture",
+        unit=PERCENTAGE,
+        icon="mdi:water-percent",
+        device_class=SensorDeviceClass.MOISTURE,
+        precision=1,
+    ),
+    ZoneSensorSpec(
+        suffix="evapotranspiration",
+        label="Evapotranspiration",
+        data_key="evapotranspiration",
+        unit=UNIT_MM,
+        icon="mdi:weather-sunny",
+        precision=2,
+    ),
+    ZoneSensorSpec(
+        suffix="precipitation",
+        label="Precipitation",
+        data_key="precipitation",
+        unit=UNIT_MM,
+        icon="mdi:weather-rainy",
+        precision=2,
+    ),
+    ZoneSensorSpec(
+        suffix="rain_lost",
+        label="Rain lost",
+        data_key="rain_lost",
+        unit=UNIT_MM,
+        icon="mdi:water-off",
+        precision=2,
+    ),
+)
+
+
+def _build_zone_entities(
+    coordinator: ETIrrigatorCoordinator, zone_key: str, zone_name: str
+) -> list[ETIrrigatorZoneSensor]:
+    return [
+        ETIrrigatorZoneSensor(coordinator, zone_key, zone_name, spec)
+        for spec in ZONE_SENSORS
+    ]
 
 
 async def async_setup_platform(
@@ -72,10 +197,12 @@ async def async_setup_platform(
     """Set up the zone sensors from the coordinator."""
     coordinator: ETIrrigatorCoordinator = hass.data[DOMAIN]
     entities = {
-        zone.key: ETIrrigatorZoneSensor(coordinator, zone.key, zone.name)
+        zone.key: _build_zone_entities(coordinator, zone.key, zone.name)
         for zone in coordinator.zones
     }
-    async_add_entities(entities.values())
+    async_add_entities(
+        [entity for group in entities.values() for entity in group]
+    )
     hass.data[DATA_SENSOR_STORE] = {"add": async_add_entities, "entities": entities}
 
 
@@ -83,43 +210,41 @@ async def async_reload_entities(hass: HomeAssistant) -> None:
     """Reconcile zone entities against the (already-reloaded) coordinator.
 
     The coordinator object is reused, so existing entities for unchanged zones
-    keep working; only removed zones are dropped and new zones are added.
+    keep working; only removed zones are dropped and new zones are added. Each
+    zone owns a *list* of entities, so a dropped zone takes all of them with it.
     """
     store = hass.data.get(DATA_SENSOR_STORE)
     if not store:
         return
     coordinator: ETIrrigatorCoordinator = hass.data[DOMAIN]
-    current: dict = store["entities"]
+    current: dict[str, list[ETIrrigatorZoneSensor]] = store["entities"]
     new_zones = {zone.key: zone for zone in coordinator.zones}
 
     registry = er.async_get(hass)
     for key in list(current):
         if key not in new_zones:
-            entity = current.pop(key)
-            entity_id = entity.entity_id
-            await entity.async_remove()
-            # Purge the registry entry too, so a dropped zone disappears instead
-            # of lingering as a restored `unavailable` state.
-            if registry.async_get(entity_id):
-                registry.async_remove(entity_id)
+            for entity in current.pop(key):
+                entity_id = entity.entity_id
+                await entity.async_remove()
+                # Purge the registry entry too, so a dropped zone disappears
+                # instead of lingering as a restored `unavailable` state.
+                if registry.async_get(entity_id):
+                    registry.async_remove(entity_id)
 
-    to_add = [
-        ETIrrigatorZoneSensor(coordinator, zone.key, zone.name)
+    added = {
+        key: _build_zone_entities(coordinator, zone.key, zone.name)
         for key, zone in new_zones.items()
         if key not in current
-    ]
-    if to_add:
-        store["add"](to_add)
-        current.update({entity.zone_key: entity for entity in to_add})
+    }
+    if added:
+        store["add"]([entity for group in added.values() for entity in group])
+        current.update(added)
 
 
 class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEntity):
-    """Recommended irrigation run-time (seconds) for one zone."""
+    """One published value of a zone's water balance."""
 
     _attr_has_entity_name = False
-    _attr_icon = "mdi:sprinkler-variant"
-    _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
@@ -127,12 +252,22 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
         coordinator: ETIrrigatorCoordinator,
         zone_key: str,
         zone_name: str,
+        spec: ZoneSensorSpec,
     ) -> None:
         super().__init__(coordinator)
         self._zone_key = zone_key
-        self._attr_name = f"ET Irrigator {zone_name}"
-        self._attr_unique_id = f"{DOMAIN}_{zone_key}"
-        self.entity_id = f"sensor.{DOMAIN}_{zone_key}"
+        self._spec = spec
+        suffix = f"_{spec.suffix}" if spec.suffix else ""
+        label = f" {spec.label}" if spec.label else ""
+        self._attr_name = f"ET Irrigator {zone_name}{label}"
+        self._attr_unique_id = f"{DOMAIN}_{zone_key}{suffix}"
+        self.entity_id = f"sensor.{DOMAIN}_{zone_key}{suffix}"
+        self._attr_icon = spec.icon
+        self._attr_device_class = spec.device_class
+        self._attr_native_unit_of_measurement = spec.unit
+        self._attr_suggested_display_precision = spec.precision
+        if spec.diagnostic:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, "et_irrigator")},
             name="ET Irrigator",
@@ -150,12 +285,16 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
         return self.coordinator.data.get(self._zone_key)
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> float | int | None:
         data = self._zone_data
-        return data.get("duration") if data else None
+        return data.get(self._spec.data_key) if data else None
 
     @property
     def extra_state_attributes(self) -> dict:
+        # Only the primary sensor carries the attribute set: repeating it on every
+        # diagnostic entity would multiply the recorder's attribute churn per zone.
+        if not self._spec.with_attributes:
+            return {}
         data = self._zone_data or {}
         return {key: data[key] for key in _ATTR_KEYS if key in data}
 

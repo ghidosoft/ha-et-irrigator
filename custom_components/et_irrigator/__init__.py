@@ -22,6 +22,7 @@ from .const import (
     CONF_ET_METHOD,
     CONF_IRRIGATION_SENSOR,
     CONF_LEAD_TIME,
+    CONF_MAX_INFILTRATION_RATE,
     CONF_MAX_WINDOW_DAYS,
     CONF_MAXIMUM_DEFICIT,
     CONF_MAXIMUM_DURATION,
@@ -100,9 +101,12 @@ ZONE_SCHEMA = vol.All(
             vol.Optional(
                 CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
             ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
+            # TAW, and the ceiling of the depletion bucket: 0 would permanently
+            # zero the zone, so it is range-checked rather than free-form.
             vol.Optional(
                 CONF_MAXIMUM_DEFICIT, default=DEFAULT_MAXIMUM_DEFICIT
-            ): vol.Coerce(float),
+            ): vol.All(vol.Coerce(float), vol.Range(min=0.1)),
+            vol.Optional(CONF_MAX_INFILTRATION_RATE): _POSITIVE_FLOAT,
             vol.Optional(CONF_MULTIPLIER, default=DEFAULT_MULTIPLIER): vol.Coerce(float),
             vol.Optional(CONF_LEAD_TIME, default=DEFAULT_LEAD_TIME): vol.Coerce(int),
             vol.Optional(
@@ -163,6 +167,7 @@ def _parse_config(hass: HomeAssistant, conf: ConfigType) -> dict:
                 precipitation_rate=zone_conf.get(CONF_PRECIPITATION_RATE),
                 crop_coefficient=zone_conf[CONF_CROP_COEFFICIENT],
                 maximum_deficit=zone_conf[CONF_MAXIMUM_DEFICIT],
+                max_infiltration_rate=zone_conf.get(CONF_MAX_INFILTRATION_RATE),
                 multiplier=zone_conf[CONF_MULTIPLIER],
                 lead_time=zone_conf[CONF_LEAD_TIME],
                 maximum_duration=zone_conf[CONF_MAXIMUM_DURATION],

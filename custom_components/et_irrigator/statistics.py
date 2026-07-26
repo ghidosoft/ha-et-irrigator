@@ -11,6 +11,7 @@ import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
 from homeassistant.components.recorder import get_instance, history
@@ -67,11 +68,14 @@ async def async_last_irrigation_end(
     max-window safety cap).
     """
     changes = await get_instance(hass).async_add_executor_job(
-        history.state_changes_during_period,
-        hass,
-        window_start,
-        now,
-        entity_id,
+        partial(
+            history.state_changes_during_period,
+            hass,
+            window_start,
+            now,
+            entity_id,
+            no_attributes=True,  # we only read `state`; skip the attribute rows
+        )
     )
     states = changes.get(entity_id, [])
 
@@ -155,10 +159,12 @@ def build_hours(
     integrated from W/m2 to MJ/m2/h; wind/dewpoint/temperature use the hourly
     mean; rain uses the per-hour ``change``. ``solar_time_hours`` is derived from
     the hour midpoint + site longitude for the FAO-56 hour angle.
+
+    Hours are the **union** of the temperature and rain rows, not just the
+    temperature ones: the step-by-step water balance is path dependent, so an hour
+    whose temperature row is missing (recorder gap, sensor restart) must not take
+    that hour's rain down with it. Such an hour gets ``t=None`` -> ETo 0.
     """
-    temp_id = sensors.get("temperature")
-    if not temp_id or temp_id not in stats:
-        return []
 
     def index(entity_id: str | None) -> dict[int, dict[str, Any]]:
         out: dict[int, dict[str, Any]] = {}
@@ -167,6 +173,7 @@ def build_hours(
                 out[int(_row_start(row).timestamp())] = row
         return out
 
+    temp_ix = index(sensors.get("temperature"))
     wind_ix = index(sensors.get("wind_speed"))
     solar_ix = index(sensors.get("solar_radiation"))
     dew_ix = index(sensors.get("dewpoint"))
@@ -175,12 +182,10 @@ def build_hours(
     _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
 
     hours: list[HourData] = []
-    for row in stats[temp_id]:
-        t = row.get("mean")
-        if t is None:
-            continue
-        start = _row_start(row)
-        key = int(start.timestamp())
+    for key in sorted(set(temp_ix) | set(rain_ix)):
+        temp_row = temp_ix.get(key)
+        t = temp_row.get("mean") if temp_row else None
+        start = dt_util.utc_from_timestamp(key)
         midpoint = start + timedelta(minutes=30)
         doy = midpoint.timetuple().tm_yday  # UTC day-of-year (matches solar-time frame)
 
@@ -224,11 +229,10 @@ def build_days(
     solar_radiation, rain) to entity ids. Solar radiation rows are assumed in
     W/m2 and integrated to MJ/m2; other channels are averaged; rain uses the
     per-hour ``change``.
-    """
-    temp_id = sensors.get("temperature")
-    if not temp_id or temp_id not in stats:
-        return []
 
+    Days are the **union** of the temperature and rain dates — see
+    :func:`build_hours` for why a rain-only day must survive.
+    """
     # Bucket each channel's rows by local date.
     def by_day(entity_id: str | None) -> dict[Any, list[dict[str, Any]]]:
         buckets: dict[Any, list[dict[str, Any]]] = defaultdict(list)
@@ -238,7 +242,7 @@ def build_days(
                 buckets[local.date()].append(row)
         return buckets
 
-    temp_by_day = by_day(temp_id)
+    temp_by_day = by_day(sensors.get("temperature"))
     wind_by_day = by_day(sensors.get("wind_speed"))
     solar_by_day = by_day(sensors.get("solar_radiation"))
     dew_by_day = by_day(sensors.get("dewpoint"))
@@ -247,12 +251,10 @@ def build_days(
     _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
 
     days: list[DayData] = []
-    for day in sorted(temp_by_day):
-        temp_rows = temp_by_day[day]
+    for day in sorted(set(temp_by_day) | set(rain_by_day)):
+        temp_rows = temp_by_day.get(day, [])
         t_min = min((r["min"] for r in temp_rows if r.get("min") is not None), default=None)
         t_max = max((r["max"] for r in temp_rows if r.get("max") is not None), default=None)
-        if t_min is None or t_max is None:
-            continue
         t_mean = _mean([r.get("mean") for r in temp_rows])
 
         # Distinguish genuine calm (0 m/s) from missing data: FAO-56 recommends a

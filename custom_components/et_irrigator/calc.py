@@ -20,6 +20,7 @@ Units (metric, FAO-56 conventions):
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from . import pyeto
@@ -35,11 +36,15 @@ class DayData:
     covered hours, ``t_min``/``t_max`` span the covered hours, and
     ``precipitation_mm`` is the rain that fell in them. There is therefore no
     separate day-fraction scaling — the partial coverage is already baked in.
+
+    ``t_min``/``t_max`` may be ``None`` for a day that has rain statistics but no
+    temperature statistics (recorder gap). Such a day contributes ETo = 0 while
+    still contributing its rain — see :func:`run_water_balance`.
     """
 
     day_of_year: int
-    t_min: float
-    t_max: float
+    t_min: float | None
+    t_max: float | None
     solar_rad_mj: float
     wind_speed: float
     t_mean: float | None = None
@@ -51,9 +56,11 @@ class DayData:
     precipitation_mm: float = 0.0
 
     @property
-    def mean_temp(self) -> float:
+    def mean_temp(self) -> float | None:
         if self.t_mean is not None:
             return self.t_mean
+        if self.t_min is None or self.t_max is None:
+            return None
         return (self.t_min + self.t_max) / 2.0
 
 
@@ -72,7 +79,13 @@ class ZoneCalcConfig:
     throughput: float | None = None  # L/min
     precipitation_rate: float | None = None  # mm/h (overrides area+throughput)
     crop_coefficient: float = 1.0
-    maximum_deficit: float = 30.0  # mm (field capacity cap)
+    # Total available water in the root zone [mm]: how much the soil can hold
+    # between field capacity and the point we refuse to dry past. Doubles as the
+    # ceiling of the depletion bucket, so it also bounds a single run-time.
+    maximum_deficit: float = 30.0
+    # Infiltration-rate ceiling [mm/h]. Rain arriving faster than this runs off
+    # instead of entering the soil. None = no cap (all gauge rain infiltrates).
+    max_infiltration_rate: float | None = None
     multiplier: float = 1.0
     lead_time: int = 0  # seconds
     maximum_duration: int = -1  # seconds, -1 = no cap
@@ -88,17 +101,98 @@ class ZoneCalcConfig:
 
 
 @dataclass
+class WaterBalance:
+    """Reconstruction of the FAO-56 soil water balance over the window.
+
+    Sign convention: ``depletion`` and ``net_deficit`` are *deficits* — positive
+    means the soil is dry, negative (only possible for ``net_deficit``) means a
+    net surplus.
+    """
+
+    depletion: float  # mm below field capacity at window end, 0..taw
+    net_deficit: float  # mm, sum(ETc - infiltration), unclamped; <0 = surplus
+    drainage: float  # mm discarded by the field-capacity clamp (soil already full)
+    runoff: float  # mm discarded by the infiltration-rate cap (rain too intense)
+    capped: float  # mm discarded by the TAW clamp (chronic under-watering)
+    evapotranspiration: float  # mm, sum of ETc
+    precipitation: float  # mm, sum of gauge rain (gross, pre-cap)
+    infiltration: float  # mm, rain that actually entered the soil
+
+
+@dataclass
 class ZoneResult:
     """Output of a single rolling-window calculation for a zone."""
 
     duration: int  # seconds
-    deficit: float  # mm
+    deficit: float  # mm, the bucket depletion (0..maximum_deficit)
     evapotranspiration: float  # mm (sum over window, * Kc)
-    precipitation: float  # mm (sum over window)
-    delta: float  # mm, precipitation - evapotranspiration (negative = deficit)
+    precipitation: float  # mm (sum over window, gross gauge rain)
+    delta: float  # mm, infiltration - evapotranspiration (negative = deficit)
+    net_deficit: float  # mm, unclamped deficit (== -delta); positive = dry
+    drainage: float  # mm of infiltrated rain lost past field capacity
+    runoff: float  # mm of gauge rain lost to the infiltration-rate cap
+    capped: float  # mm of ET the TAW ceiling refused to account for
+    infiltration: float  # mm of gauge rain that entered the soil
+    soil_moisture: float | None  # % of TAW still available, 0..100
     number_of_data_points: int
     explanation: str = ""
     daily_eto: list[float] = field(default_factory=list)
+
+
+def run_water_balance(
+    etc: Sequence[float],
+    rain: Sequence[float],
+    *,
+    taw: float,
+    step_hours: float = 1.0,
+    max_infiltration_rate: float | None = None,
+) -> WaterBalance:
+    """Step-by-step FAO-56 soil water balance.
+
+    ``etc`` (crop ET per step, mm) and ``rain`` (gauge rain per step, mm) are
+    aligned by index. The depletion is clamped to ``[0, taw]`` at **every step**,
+    which is what makes the result physical: rain arriving on an already-full soil
+    drains away *when it falls* instead of retroactively cancelling the ET of the
+    rest of the window.
+
+    Each step is ``f(d) = clamp(d + etc - infiltration, 0, taw)`` — monotone and
+    1-Lipschitz, and composition preserves both. So sliding the window by one step
+    changes the answer by at most that step's net drying, and the memory of the
+    ``depletion = 0`` initial condition is erased entirely the first time a later
+    step hits a clamp. That is why the reconstruction is stable without persisting
+    any state.
+    """
+    depletion = drainage = runoff = capped = 0.0
+    net_deficit = 0.0
+    eto_total = precip_total = infil_total = 0.0
+    cap = max_infiltration_rate * step_hours if max_infiltration_rate else None
+
+    for etc_step, rain_step in zip(etc, rain):
+        infiltration = min(rain_step, cap) if cap is not None else rain_step
+        runoff += rain_step - infiltration
+        eto_total += etc_step
+        precip_total += rain_step
+        infil_total += infiltration
+
+        net_deficit += etc_step - infiltration
+        depletion += etc_step - infiltration
+        if depletion < 0.0:
+            drainage += -depletion
+            depletion = 0.0
+        elif depletion > taw:
+            capped += depletion - taw
+            depletion = taw
+
+    return WaterBalance(
+        depletion=depletion,
+        net_deficit=net_deficit,
+        drainage=drainage,
+        runoff=runoff,
+        capped=capped,
+        evapotranspiration=eto_total,
+        precipitation=precip_total,
+        infiltration=infil_total,
+    )
 
 
 def _actual_vapour_pressure(day: DayData) -> float:
@@ -120,10 +214,17 @@ def eto_fao56_day(day: DayData, latitude: float, elevation: float) -> float:
 
     Uses *measured* solar radiation for the net-radiation term. For a partial
     first/last window day, ``day`` already holds only the covered hours' data.
+
+    Returns 0.0 when the day has no temperature statistics: the water balance then
+    credits that day's rain with no ET, which under-estimates ET rather than
+    silently dropping the rain.
     """
-    lat_rad = pyeto.deg2rad(latitude)
     tmin, tmax = day.t_min, day.t_max
     tmean = day.mean_temp
+    if tmin is None or tmax is None or tmean is None:
+        return 0.0
+
+    lat_rad = pyeto.deg2rad(latitude)
 
     svp = pyeto.mean_svp(tmin, tmax)
     avp = _actual_vapour_pressure(day)
@@ -175,30 +276,39 @@ def duration_seconds(deficit: float, cfg: ZoneCalcConfig) -> int:
 
 
 def _balance_result(
-    eto_total: float,
-    precip_total: float,
+    wb: WaterBalance,
     n_points: int,
     cfg: ZoneCalcConfig,
     window_label: str,
     per_step_eto: list[float],
 ) -> ZoneResult:
-    """Turn an integrated ETo + precipitation over the window into a result."""
-    eto_crop = eto_total * cfg.crop_coefficient
-    delta = precip_total - eto_crop
-    deficit = min(cfg.maximum_deficit, max(0.0, -delta))
-    duration = duration_seconds(deficit, cfg)
+    """Turn a reconstructed water balance into the published zone result."""
+    duration = duration_seconds(wb.depletion, cfg)
+    taw = cfg.maximum_deficit
+    soil_moisture = 100.0 * (1.0 - wb.depletion / taw) if taw > 0 else None
 
     explanation = (
-        f"window={window_label} ETo*Kc={eto_crop:.2f}mm precip={precip_total:.2f}mm "
-        f"deficit={deficit:.2f}mm rate={cfg.rate_mm_h:.2f}mm/h "
-        f"-> {duration}s"
+        f"window={window_label} ETc={wb.evapotranspiration:.2f}mm "
+        f"rain={wb.precipitation:.2f}mm (infiltrated {wb.infiltration:.2f}mm, "
+        f"runoff {wb.runoff:.2f}mm, drained {wb.drainage:.2f}mm) "
+        f"deficit={wb.depletion:.2f}/{taw:.2f}mm "
+        f"rate={cfg.rate_mm_h:.2f}mm/h -> {duration}s"
     )
+    if wb.capped > 0:
+        explanation += f" [capped {wb.capped:.2f}mm at TAW]"
+
     return ZoneResult(
         duration=duration,
-        deficit=round(deficit, 3),
-        evapotranspiration=round(eto_crop, 3),
-        precipitation=round(precip_total, 3),
-        delta=round(delta, 3),
+        deficit=round(wb.depletion, 3),
+        evapotranspiration=round(wb.evapotranspiration, 3),
+        precipitation=round(wb.precipitation, 3),
+        delta=round(-wb.net_deficit, 3),
+        net_deficit=round(wb.net_deficit, 3),
+        drainage=round(wb.drainage, 3),
+        runoff=round(wb.runoff, 3),
+        capped=round(wb.capped, 3),
+        infiltration=round(wb.infiltration, 3),
+        soil_moisture=round(soil_moisture, 1) if soil_moisture is not None else None,
         number_of_data_points=n_points,
         explanation=explanation,
         daily_eto=[round(e, 3) for e in per_step_eto],
@@ -208,17 +318,28 @@ def _balance_result(
 def compute_zone(days: list[DayData], cfg: ZoneCalcConfig) -> ZoneResult:
     """Daily-method rolling-window calculation for one zone.
 
-    ``days`` are the per-day aggregates spanning [last_irrigation, now]. The soil
-    is assumed at field capacity (deficit 0) at the window start; this holds right
-    after watering, but in the fallback case (no irrigation within max_window_days)
-    it is an assumption mitigated only by ``maximum_deficit``. Pure function of
-    ``days`` + ``cfg`` -> idempotent.
+    ``days`` are the per-day aggregates spanning [last_irrigation, now], run
+    through :func:`run_water_balance` one day at a time. The soil is assumed at
+    field capacity (depletion 0) at the window start; this holds right after
+    watering, and in the fallback case (no irrigation within max_window_days) the
+    error is bounded and erased by the first clamp.
+
+    Two approximations relative to the hourly method: rain and ET of the *same
+    day* net out before the clamp, so drainage is under-counted; and the
+    infiltration cap is applied as ``rate * 24h``, which almost never binds. The
+    hourly method is the default and the recommended one.
+
+    Pure function of ``days`` + ``cfg`` -> idempotent.
     """
     eto = [eto_fao56_day(d, cfg.latitude, cfg.elevation) for d in days]
-    return _balance_result(
-        sum(eto), sum(d.precipitation_mm for d in days), len(days), cfg,
-        f"{len(days)}d", eto,
+    wb = run_water_balance(
+        [e * cfg.crop_coefficient for e in eto],
+        [d.precipitation_mm for d in days],
+        taw=cfg.maximum_deficit,
+        step_hours=24.0,
+        max_infiltration_rate=cfg.max_infiltration_rate,
     )
+    return _balance_result(wb, len(days), cfg, f"{len(days)}d", eto)
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +362,9 @@ class HourData:
 
     day_of_year: int
     solar_time_hours: float  # solar time at the hour midpoint (for the hour angle)
-    t: float  # mean hourly temperature, deg C
+    # Mean hourly temperature [deg C], or None for an hour with rain statistics but
+    # no temperature statistics (recorder gap) -> ETo 0, rain still counted.
+    t: float | None
     solar_rad_mj: float  # hourly solar radiation total, MJ m-2 h-1
     wind_speed: float  # m s-1
     wind_height: float = 2.0
@@ -278,8 +401,14 @@ def _avp_hourly(hour: HourData) -> float:
 
 
 def eto_fao56_hourly(hour: HourData, latitude: float, elevation: float) -> float:
-    """Reference ET for one hour [mm h-1], FAO-56 Penman-Monteith (Eq. 53)."""
+    """Reference ET for one hour [mm h-1], FAO-56 Penman-Monteith (Eq. 53).
+
+    Returns 0.0 for an hour with no temperature statistics, so that the hour's rain
+    still reaches the water balance (under-estimating ET is the safe direction).
+    """
     t = hour.t
+    if t is None:
+        return 0.0
     delta = pyeto.delta_svp(t)
     psy = pyeto.psy_const(pyeto.atm_pressure(elevation))
     es = pyeto.svp_from_t(t)
@@ -310,12 +439,17 @@ def eto_fao56_hourly(hour: HourData, latitude: float, elevation: float) -> float
 def compute_zone_hourly(hours: list[HourData], cfg: ZoneCalcConfig) -> ZoneResult:
     """Hourly-method rolling-window calculation for one zone.
 
-    Sums per-hour ETo over the window. Because each completed hour's data is
-    final, the integrated deficit is monotonic between irrigations (no daily
-    re-aggregation wobble). Pure function of ``hours`` + ``cfg`` -> idempotent.
+    Runs the soil water balance one hour at a time. Because each completed hour's
+    data is final, the deficit is monotonic between irrigations during dry spells
+    (no daily re-aggregation wobble), and rain is drained against the soil state of
+    the hour it fell in. Pure function of ``hours`` + ``cfg`` -> idempotent.
     """
     eto = [eto_fao56_hourly(h, cfg.latitude, cfg.elevation) for h in hours]
-    return _balance_result(
-        sum(eto), sum(h.precipitation_mm for h in hours), len(hours), cfg,
-        f"{len(hours)}h", eto,
+    wb = run_water_balance(
+        [e * cfg.crop_coefficient for e in eto],
+        [h.precipitation_mm for h in hours],
+        taw=cfg.maximum_deficit,
+        step_hours=1.0,
+        max_infiltration_rate=cfg.max_infiltration_rate,
     )
+    return _balance_result(wb, len(hours), cfg, f"{len(hours)}h", eto)

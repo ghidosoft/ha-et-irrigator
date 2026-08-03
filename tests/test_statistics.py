@@ -11,9 +11,11 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.et_irrigator.const import DEFAULT_WIND_SPEED
 from custom_components.et_irrigator.statistics import (
+    _row_start,
     async_fetch_statistics,
     build_days,
     build_hours,
+    slice_stats,
 )
 
 
@@ -155,6 +157,36 @@ def test_build_hours_aligns_channels_and_converts_solar():
     assert h.wind_height == 10.0
     # 12:30 UTC midpoint, lon +10° -> solar time ~13.2h (+ small seasonal term)
     assert 12.8 < h.solar_time_hours < 13.6
+
+
+def test_build_hours_carries_the_hour_start():
+    """The export needs the true hour, and it must survive as an aware UTC time."""
+    base = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    stats = {"sensor.t": _aligned_rows("mean", 25.0)}
+    sensors = {
+        "temperature": "sensor.t",
+        "wind_speed": None,
+        "solar_radiation": None,
+        "dewpoint": None,
+        "rain": None,
+    }
+    hours = build_hours(stats, sensors, wind_height=2.0, longitude=10.0)
+    assert [h.start for h in hours] == [base + timedelta(hours=i) for i in range(3)]
+    assert all(h.start.tzinfo is not None for h in hours)
+
+
+def test_slice_stats_keeps_only_rows_from_the_reference_on():
+    """The fetch spans the export window; the balance must still see its own."""
+    base = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    stats = {"sensor.t": _aligned_rows("mean", 25.0)}  # 12:00, 13:00, 14:00
+    sliced = slice_stats(stats, base + timedelta(hours=1))
+    assert [_row_start(r) for r in sliced["sensor.t"]] == [
+        base + timedelta(hours=1),
+        base + timedelta(hours=2),
+    ]
+    # Float epoch starts (what the real recorder returns) are handled too.
+    epoch = {"sensor.t": [{"start": r["start"].timestamp(), "mean": 1.0} for r in stats["sensor.t"]]}
+    assert len(slice_stats(epoch, base + timedelta(hours=2))["sensor.t"]) == 1
 
 
 def test_build_hours_wind_defaults_when_missing():

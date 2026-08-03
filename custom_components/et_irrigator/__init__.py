@@ -201,7 +201,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     )
 
     async def _handle_recalculate(_call: ServiceCall) -> None:
-        # Manual trigger: force an immediate (non-debounced) recompute.
+        # Manual trigger: force an immediate (non-debounced) recompute, and take
+        # it as a request to redraw the exported window rather than extend it.
+        coordinator.request_full_export()
         await coordinator.async_refresh()
 
     hass.services.async_register(DOMAIN, SERVICE_RECALCULATE, _handle_recalculate)

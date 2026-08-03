@@ -32,6 +32,7 @@ from .const import (
     ATTR_DRAINAGE,
     ATTR_EVAPOTRANSPIRATION,
     ATTR_EXPLANATION,
+    ATTR_HOURLY_EXPORT_THROUGH,
     ATTR_INFILTRATION,
     ATTR_LAST_CALCULATED,
     ATTR_LEAD_TIME,
@@ -51,14 +52,18 @@ from .const import (
     ATTR_WINDOW_END,
     ATTR_WINDOW_START,
     DOMAIN,
+    HOURLY_SUFFIXES,
+    SUFFIX_HOURLY_DRAINAGE,
+    SUFFIX_HOURLY_RAIN,
+    SUFFIX_HOURLY_RUNOFF,
+    UNIT_MM,
 )
 from .coordinator import ETIrrigatorCoordinator
+from .statistics import async_clear_hourly_series
 
 # hass.data key holding the platform's add-callback and current entities, so a
 # YAML reload can reconcile zone entities without a restart.
 DATA_SENSOR_STORE = f"{DOMAIN}_sensor_store"
-
-UNIT_MM = "mm"
 
 # Keys copied verbatim from coordinator data into the primary sensor's attributes.
 _ATTR_KEYS = (
@@ -80,6 +85,7 @@ _ATTR_KEYS = (
     ATTR_WINDOW_START,
     ATTR_WINDOW_END,
     ATTR_LAST_CALCULATED,
+    ATTR_HOURLY_EXPORT_THROUGH,
     ATTR_NUMBER_OF_DATA_POINTS,
     ATTR_MULTIPLIER,
     ATTR_LEAD_TIME,
@@ -96,16 +102,19 @@ class ZoneSensorSpec:
 
     suffix: str  # "" == the primary run-time sensor
     label: str  # appended to the zone name; "" for the primary sensor
-    data_key: str  # key to read from the coordinator's per-zone dict
+    # Key to read from the coordinator's per-zone dict, or None for a sensor that
+    # deliberately has no state (see the hourly-export specs below).
+    data_key: str | None
     unit: str
     icon: str
     device_class: SensorDeviceClass | None = None
     precision: int | None = None
     diagnostic: bool = True
     with_attributes: bool = False
+    state_class: SensorStateClass | None = SensorStateClass.MEASUREMENT
 
 
-# Every spec uses state_class MEASUREMENT — that (not entity_category) is what
+# Most specs use state_class MEASUREMENT — that (not entity_category) is what
 # makes Home Assistant record long-term statistics, so the diagnostic sensors are
 # graphable in the native History/Statistics cards.
 #
@@ -113,6 +122,9 @@ class ZoneSensorSpec:
 # window, so they fall when old data scrolls out and HA would fabricate resets.
 # Deliberately no SensorDeviceClass.PRECIPITATION either: its unit conversion is
 # meaningless for a soil deficit and ambiguous for a signed value.
+#
+# The three `hourly_*` specs are the exception, with state_class None and no
+# data_key at all; see the block above them for why both are required.
 ZONE_SENSORS: tuple[ZoneSensorSpec, ...] = (
     ZoneSensorSpec(
         suffix="",
@@ -176,6 +188,46 @@ ZONE_SENSORS: tuple[ZoneSensorSpec, ...] = (
         icon="mdi:water-off",
         precision=2,
     ),
+    # --- Per-hour series, published as statistics rather than as states -----
+    #
+    # These three carry no state at all. They exist only as anchors:
+    # `async_import_statistics` requires a valid entity_id, and chart cards
+    # resolve `hass.states[entity]` before they will render a series at all.
+    # The values live in the recorder's statistics table, written by the
+    # coordinator with each hour's true timestamp, and are read back as
+    # `change`. See statistics.py for why a state could not do this job.
+    #
+    # state_class MUST stay None, and native_value MUST stay non-numeric:
+    #   * with a state_class, the recorder would compile its own statistics for
+    #     the same id (has_mean=True) and fight our import (has_sum=True),
+    #     rewriting the metadata row against each other every hour;
+    #   * with a numeric state and no state_class, sensor/recorder.py raises the
+    #     `state_class_removed` repair, which is not fixable and would sit in
+    #     Repairs forever.
+    ZoneSensorSpec(
+        suffix=SUFFIX_HOURLY_RAIN,
+        label="Hourly rain",
+        data_key=None,
+        unit=UNIT_MM,
+        icon="mdi:weather-pouring",
+        state_class=None,
+    ),
+    ZoneSensorSpec(
+        suffix=SUFFIX_HOURLY_RUNOFF,
+        label="Hourly runoff",
+        data_key=None,
+        unit=UNIT_MM,
+        icon="mdi:water-alert",
+        state_class=None,
+    ),
+    ZoneSensorSpec(
+        suffix=SUFFIX_HOURLY_DRAINAGE,
+        label="Hourly drainage",
+        data_key=None,
+        unit=UNIT_MM,
+        icon="mdi:water-arrow-down",
+        state_class=None,
+    ),
 )
 
 
@@ -221,6 +273,7 @@ async def async_reload_entities(hass: HomeAssistant) -> None:
     new_zones = {zone.key: zone for zone in coordinator.zones}
 
     registry = er.async_get(hass)
+    orphaned: list[str] = []
     for key in list(current):
         if key not in new_zones:
             for entity in current.pop(key):
@@ -230,6 +283,10 @@ async def async_reload_entities(hass: HomeAssistant) -> None:
                 # instead of lingering as a restored `unavailable` state.
                 if registry.async_get(entity_id):
                     registry.async_remove(entity_id)
+            # The imported statistics outlive the entity, so they have to go too:
+            # otherwise `validate_statistics` reports them as `no_state` forever.
+            orphaned += [f"sensor.{DOMAIN}_{key}_{suffix}" for suffix in HOURLY_SUFFIXES]
+    await async_clear_hourly_series(hass, orphaned)
 
     added = {
         key: _build_zone_entities(coordinator, zone.key, zone.name)
@@ -245,7 +302,6 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
     """One published value of a zone's water balance."""
 
     _attr_has_entity_name = False
-    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
         self,
@@ -263,6 +319,7 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
         self._attr_unique_id = f"{DOMAIN}_{zone_key}{suffix}"
         self.entity_id = f"sensor.{DOMAIN}_{zone_key}{suffix}"
         self._attr_icon = spec.icon
+        self._attr_state_class = spec.state_class
         self._attr_device_class = spec.device_class
         self._attr_native_unit_of_measurement = spec.unit
         self._attr_suggested_display_precision = spec.precision
@@ -286,6 +343,13 @@ class ETIrrigatorZoneSensor(CoordinatorEntity[ETIrrigatorCoordinator], SensorEnt
 
     @property
     def native_value(self) -> float | int | None:
+        # None (-> state "unknown") is the *point* for the hourly-export specs,
+        # not a missing feature. They exist only so that a valid entity_id and a
+        # hass.states entry back the imported statistics; a numeric state here
+        # would trip the non-fixable `state_class_removed` repair, because their
+        # state_class is deliberately None.
+        if self._spec.data_key is None:
+            return None
         data = self._zone_data
         return data.get(self._spec.data_key) if data else None
 

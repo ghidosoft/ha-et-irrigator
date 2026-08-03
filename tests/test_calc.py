@@ -14,6 +14,8 @@ from custom_components.et_irrigator.calc import (
     eto_fao56_hourly,
     ra_hourly,
     run_water_balance,
+    step_cap,
+    step_infiltration,
 )
 
 
@@ -234,6 +236,64 @@ def test_infiltration_cap_scales_with_step_length():
     assert daily.runoff == 0.0
 
 
+def test_steps_sum_back_to_the_totals():
+    """The per-step trace must be a decomposition of the window, not a parallel guess."""
+    etc = [1.0, 2.0, 0.5, 3.0]
+    rain = [30.0, 0.0, 4.0, 1.0]
+    wb = run_water_balance(etc, rain, taw=10.0, max_infiltration_rate=8.0)
+
+    assert len(wb.steps) == len(etc)
+    assert math.isclose(sum(s.precipitation for s in wb.steps), wb.precipitation)
+    assert math.isclose(sum(s.infiltration for s in wb.steps), wb.infiltration)
+    assert math.isclose(sum(s.runoff for s in wb.steps), wb.runoff)
+    assert math.isclose(sum(s.evapotranspiration for s in wb.steps), wb.evapotranspiration)
+    # drainage is the accumulator; each step records only its own delta
+    assert math.isclose(sum(s.drainage for s in wb.steps), wb.drainage)
+    assert math.isclose(wb.steps[-1].depletion, wb.depletion)
+
+
+def test_step_rain_and_runoff_are_window_independent():
+    """The contract the hourly export rests on.
+
+    Per step, precipitation and runoff are pure functions of that step's mm and
+    the cap, so they are identical whether or not the window started earlier.
+    Drainage is not: it follows the bucket's trajectory. Rewriting the first two
+    in place is therefore safe; rewriting drainage is not.
+    """
+    # A dry prefix, so the longer window reaches the tail with a part-empty
+    # bucket while the short one starts at field capacity. Without that the
+    # clamps erase the difference and the two agree by accident.
+    etc = [4.0, 3.0, 0.0, 0.0, 0.0, 0.0]
+    rain = [0.0, 0.0, 0.0, 5.0, 30.0, 0.0]
+
+    full = run_water_balance(etc, rain, taw=10.0, max_infiltration_rate=8.0)
+    late = run_water_balance(etc[3:], rain[3:], taw=10.0, max_infiltration_rate=8.0)
+
+    tail = full.steps[3:]
+    assert [s.precipitation for s in tail] == [s.precipitation for s in late.steps]
+    assert [s.runoff for s in tail] == [s.runoff for s in late.steps]
+    assert [s.infiltration for s in tail] == [s.infiltration for s in late.steps]
+
+    # The counterexample: the same clock hours drain differently, because the
+    # earlier window arrives at them with a different bucket level.
+    assert [s.drainage for s in tail] != [s.drainage for s in late.steps]
+
+
+def test_step_infiltration_matches_the_loop():
+    """The export and the balance must share one expression, not two equivalent ones."""
+    assert step_cap(None, 1.0) is None
+    assert step_cap(0.0, 1.0) is None  # falsy disables the cap, as in the loop
+    assert step_cap(10.0, 24.0) == 240.0
+
+    assert step_infiltration(30.0, None) == 30.0  # uncapped: everything soaks in
+    assert step_infiltration(30.0, 10.0) == 10.0
+    assert step_infiltration(2.0, 10.0) == 2.0  # a drizzle is untouched
+
+    cap = step_cap(8.0, 1.0)
+    wb = run_water_balance([0.0], [30.0], taw=100.0, max_infiltration_rate=8.0)
+    assert wb.steps[0].runoff == 30.0 - step_infiltration(30.0, cap)
+
+
 def test_net_deficit_sign_convention():
     """net_deficit is a deficit (positive = dry); delta is its legacy inverse."""
     cfg = ZoneCalcConfig(latitude=45, elevation=250, area=50.0, throughput=12.0)
@@ -363,6 +423,15 @@ def test_hourly_deficit_is_monotonic():
         d = compute_zone_hourly(hours[:n], cfg).deficit
         assert d >= prev - 1e-9  # non-decreasing
         prev = d
+
+
+def test_compute_zone_hourly_publishes_one_step_per_hour():
+    """The export aligns steps to hours by position, so the two must not drift."""
+    cfg = ZoneCalcConfig(latitude=45, elevation=160, area=50.0, throughput=12.0)
+    hours = _synthetic_day_hours()
+    res = compute_zone_hourly(hours, cfg)
+    assert len(res.steps) == len(hours)
+    assert math.isclose(sum(s.precipitation for s in res.steps), res.precipitation, abs_tol=1e-3)
 
 
 def test_compute_zone_hourly_rain_refills_then_et_resumes():

@@ -22,6 +22,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from . import pyeto
 from .const import ALBEDO
@@ -100,6 +101,38 @@ class ZoneCalcConfig:
         return 0.0
 
 
+def step_cap(max_infiltration_rate: float | None, step_hours: float) -> float | None:
+    """Rain one step can absorb [mm], or None when uncapped.
+
+    The test is deliberately *falsy*, not ``is None``: a configured 0 mm/h would
+    otherwise cap every drop away. The schema forbids it, but the two callers
+    (the balance loop and the hourly export) must agree on the same behaviour.
+    """
+    return max_infiltration_rate * step_hours if max_infiltration_rate else None
+
+
+def step_infiltration(rain_step: float, cap: float | None) -> float:
+    """Gauge rain that actually enters the soil in one step [mm]."""
+    return min(rain_step, cap) if cap is not None else rain_step
+
+
+@dataclass
+class BalanceStep:
+    """What one step of the water balance did, kept for per-hour export.
+
+    All fields are the *delta of that step*, never a running total — including
+    ``drainage``, which the loop accumulates separately. ``depletion`` is the
+    exception by nature: it is a level, the value at the end of the step.
+    """
+
+    precipitation: float  # mm, gauge rain in this step (gross, pre-cap)
+    infiltration: float  # mm, the part of it that entered the soil
+    runoff: float  # mm shed by the infiltration-rate cap
+    evapotranspiration: float  # mm, ETc of this step
+    drainage: float  # mm pushed past field capacity by this step
+    depletion: float  # mm, the bucket level *after* this step, 0..taw
+
+
 @dataclass
 class WaterBalance:
     """Reconstruction of the FAO-56 soil water balance over the window.
@@ -117,6 +150,7 @@ class WaterBalance:
     evapotranspiration: float  # mm, sum of ETc
     precipitation: float  # mm, sum of gauge rain (gross, pre-cap)
     infiltration: float  # mm, rain that actually entered the soil
+    steps: list[BalanceStep] = field(default_factory=list)  # one per input step
 
 
 @dataclass
@@ -137,6 +171,7 @@ class ZoneResult:
     number_of_data_points: int
     explanation: str = ""
     daily_eto: list[float] = field(default_factory=list)
+    steps: list[BalanceStep] = field(default_factory=list)  # aligned with the input
 
 
 def run_water_balance(
@@ -161,27 +196,53 @@ def run_water_balance(
     ``depletion = 0`` initial condition is erased entirely the first time a later
     step hits a clamp. That is why the reconstruction is stable without persisting
     any state.
+
+    ``steps`` records what each step did, which is what the hourly statistics
+    export publishes. Two very different guarantees live in there:
+
+    * ``precipitation``, ``infiltration`` and ``runoff`` are **pure functions of
+      that step's mm and the cap**. They do not depend on where the window starts,
+      so they are identical across recomputations and safe to rewrite in place.
+    * ``drainage`` (and ``depletion``) are **path-dependent**: they follow the
+      trajectory of the bucket, hence the window start. The same clock hour can
+      legitimately get a different drainage in a later run, so it must never be
+      rewritten from a shifted window.
     """
     depletion = drainage = runoff = capped = 0.0
     net_deficit = 0.0
     eto_total = precip_total = infil_total = 0.0
-    cap = max_infiltration_rate * step_hours if max_infiltration_rate else None
+    cap = step_cap(max_infiltration_rate, step_hours)
+    steps: list[BalanceStep] = []
 
     for etc_step, rain_step in zip(etc, rain):
-        infiltration = min(rain_step, cap) if cap is not None else rain_step
-        runoff += rain_step - infiltration
+        infiltration = step_infiltration(rain_step, cap)
+        runoff_step = rain_step - infiltration
+        runoff += runoff_step
         eto_total += etc_step
         precip_total += rain_step
         infil_total += infiltration
 
         net_deficit += etc_step - infiltration
         depletion += etc_step - infiltration
+        drained_step = 0.0
         if depletion < 0.0:
-            drainage += -depletion
+            drained_step = -depletion
+            drainage += drained_step
             depletion = 0.0
         elif depletion > taw:
             capped += depletion - taw
             depletion = taw
+
+        steps.append(
+            BalanceStep(
+                precipitation=rain_step,
+                infiltration=infiltration,
+                runoff=runoff_step,
+                evapotranspiration=etc_step,
+                drainage=drained_step,
+                depletion=depletion,
+            )
+        )
 
     return WaterBalance(
         depletion=depletion,
@@ -192,6 +253,7 @@ def run_water_balance(
         evapotranspiration=eto_total,
         precipitation=precip_total,
         infiltration=infil_total,
+        steps=steps,
     )
 
 
@@ -312,6 +374,9 @@ def _balance_result(
         number_of_data_points=n_points,
         explanation=explanation,
         daily_eto=[round(e, 3) for e in per_step_eto],
+        # Unrounded on purpose: rounding belongs at the recorder boundary, where
+        # the hourly export decides its own precision.
+        steps=wb.steps,
     )
 
 
@@ -370,6 +435,10 @@ class HourData:
     wind_height: float = 2.0
     dewpoint: float | None = None
     precipitation_mm: float = 0.0
+    # UTC start of the clock hour. Carried for the hourly statistics export only —
+    # nothing in this module reads it, and ``datetime`` is stdlib, so the
+    # "no Home Assistant dependencies" contract above still holds.
+    start: datetime | None = None
 
 
 def ra_hourly(latitude: float, day_of_year: int, solar_time_hours: float,

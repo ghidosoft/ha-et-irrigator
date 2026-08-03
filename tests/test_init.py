@@ -1,10 +1,16 @@
 """Component tests: YAML setup, sensor output, service, idempotency."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.setup import async_setup_component
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_wait_recording_done,
+)
 
 from custom_components.et_irrigator import coordinator as coord_mod
 from custom_components.et_irrigator.calc import DayData
@@ -159,6 +165,194 @@ async def test_hourly_method_end_to_end(
     assert int(state.state) > 0
     assert state.attributes["number_of_data_points"] == 6
     assert "6h" in state.attributes["explanation"]
+
+
+def _rain_hours(now, wet_index, wet_mm):
+    """24 dry midday-ish hours ending before `now`, with rain in exactly one."""
+    from custom_components.et_irrigator.calc import HourData
+
+    first = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)
+    return [
+        HourData(
+            day_of_year=196,
+            solar_time_hours=10.5,
+            t=30.0,
+            solar_rad_mj=2.6,
+            wind_speed=2.0,
+            dewpoint=14.0,
+            precipitation_mm=wet_mm if i == wet_index else 0.0,
+            start=first + timedelta(hours=i),
+        )
+        for i in range(24)
+    ]
+
+
+async def _hourly_series(hass, statistic_id):
+    """Read an exported series back the way the chart does."""
+    rows = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utcnow() - timedelta(days=3),
+        dt_util.utcnow() + timedelta(hours=1),
+        {statistic_id},
+        "hour",
+        None,
+        {"change", "sum"},
+    )
+    return [
+        (dt_util.utc_from_timestamp(r["start"]), round(r["change"], 4), r["sum"])
+        for r in rows.get(statistic_id, [])
+    ]
+
+
+def _patch_hourly(monkeypatch, hours):
+    async def fake_last(hass, entity_id, window_start, now):
+        return window_start
+
+    async def fake_fetch(hass, ids, start, now):
+        return {}
+
+    monkeypatch.setattr(coord_mod, "async_last_irrigation_end", fake_last)
+    monkeypatch.setattr(coord_mod, "async_fetch_statistics", fake_fetch)
+    monkeypatch.setattr(
+        coord_mod, "build_hours", lambda *a, **k: hours(dt_util.utcnow())
+    )
+
+
+async def test_exported_rain_lands_on_the_hour_it_fell_in(
+    recorder_mock, hass, enable_et_irrigator, monkeypatch
+):
+    """The regression test for the real bug.
+
+    Rain falls in one hour; the coordinator only learns about it an hour later.
+    The exported bar must sit on the hour it rained, not on the hour the
+    coordinator happened to run — which is what a plain state would have given.
+    """
+    hourly_config = {DOMAIN: {**CONFIG[DOMAIN], "et_method": "hourly"}}
+    _patch_hourly(monkeypatch, lambda now: _rain_hours(now, wet_index=5, wet_mm=0.6))
+
+    assert await async_setup_component(hass, DOMAIN, hourly_config)
+    await hass.async_block_till_done()
+    await async_wait_recording_done(hass)
+
+    series = await _hourly_series(hass, f"{ENTITY}_hourly_rain")
+    wet = [(start, change) for start, change, _ in series if change > 0]
+    assert len(wet) == 1, f"expected exactly one wet hour, got {wet}"
+
+    expected = (
+        dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+        - timedelta(hours=24)
+        + timedelta(hours=5)
+    )
+    assert wet[0] == (expected, 0.6)
+    # Every hour gets a row, dry ones included, so the chart needs no bucketing
+    # of its own. All 24 here are complete: the fixture stops at the last full
+    # hour, and the in-progress one is never offered.
+    assert len(series) == 24
+    assert all(change == 0.0 for start, change, _ in series if start != expected)
+
+
+async def test_a_restart_adds_no_phantom_rainfall(
+    recorder_mock, hass, enable_et_irrigator, monkeypatch
+):
+    """Setting the integration up again must update rows, never add them.
+
+    This is the exact failure that produced two 0.6 mm spikes from one shower:
+    a restart rewrote the level sensor's state, and the chart drew it as a
+    second rainfall. The export rewrites its whole window on setup, so this
+    covers both the upsert and the correctness of the anchor lookup.
+    """
+    hourly_config = {DOMAIN: {**CONFIG[DOMAIN], "et_method": "hourly"}}
+    _patch_hourly(monkeypatch, lambda now: _rain_hours(now, wet_index=5, wet_mm=0.6))
+
+    assert await async_setup_component(hass, DOMAIN, hourly_config)
+    await hass.async_block_till_done()
+    await async_wait_recording_done(hass)
+    before = await _hourly_series(hass, f"{ENTITY}_hourly_rain")
+
+    # A restart: same inputs, another full-rewrite export.
+    hass.data[DOMAIN].request_full_export()
+    await hass.data[DOMAIN].async_refresh()
+    await hass.async_block_till_done()
+    await async_wait_recording_done(hass)
+    after = await _hourly_series(hass, f"{ENTITY}_hourly_rain")
+
+    assert after == before
+    assert sum(1 for _, change, _ in after if change > 0) == 1
+    sums = [s for _, _, s in after]
+    assert sums == sorted(sums)
+
+
+async def test_runoff_and_drainage_split_the_lost_rain(
+    recorder_mock, hass, enable_et_irrigator, monkeypatch
+):
+    """The two ways rain is lost are published separately, on the right hours.
+
+    30 mm in one hour against a 10 mm/h cap: 20 mm runs off *in that hour*, and
+    what does infiltrate overflows a soil that is already near capacity. Keeping
+    them apart is the point — runoff is the deterministic half, and the only one
+    that says whether `max_infiltration_rate` is set correctly.
+    """
+    hourly_config = {
+        DOMAIN: {
+            **CONFIG[DOMAIN],
+            "et_method": "hourly",
+            "zones": [
+                {
+                    **CONFIG[DOMAIN]["zones"][0],
+                    "max_infiltration_rate": 10.0,
+                    "maximum_deficit": 5.0,
+                }
+            ],
+        }
+    }
+    _patch_hourly(monkeypatch, lambda now: _rain_hours(now, wet_index=5, wet_mm=30.0))
+
+    assert await async_setup_component(hass, DOMAIN, hourly_config)
+    await hass.async_block_till_done()
+    await async_wait_recording_done(hass)
+
+    wet_hour = (
+        dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+        - timedelta(hours=24)
+        + timedelta(hours=5)
+    )
+
+    runoff = await _hourly_series(hass, f"{ENTITY}_hourly_runoff")
+    assert [(s, c) for s, c, _ in runoff if c > 0] == [(wet_hour, 20.0)]
+
+    drainage = await _hourly_series(hass, f"{ENTITY}_hourly_drainage")
+    drained = [(s, c) for s, c, _ in drainage if c > 0]
+    assert drained and drained[0][0] == wet_hour
+    # Gross rain is untouched by the cap: it is what the gauge measured.
+    rain = await _hourly_series(hass, f"{ENTITY}_hourly_rain")
+    assert [(s, c) for s, c, _ in rain if c > 0] == [(wet_hour, 30.0)]
+
+
+async def test_hourly_entities_are_stateless_anchors(
+    recorder_mock, hass, enable_et_irrigator, monkeypatch
+):
+    """They must exist for the chart, and carry no numeric state or state_class.
+
+    A numeric state without a state_class trips the non-fixable
+    `state_class_removed` repair; a state_class would make the recorder compile
+    competing statistics for the same id.
+    """
+    hourly_config = {DOMAIN: {**CONFIG[DOMAIN], "et_method": "hourly"}}
+    _patch_hourly(monkeypatch, lambda now: _rain_hours(now, wet_index=5, wet_mm=0.6))
+
+    assert await async_setup_component(hass, DOMAIN, hourly_config)
+    await hass.async_block_till_done()
+
+    for suffix in ("hourly_rain", "hourly_runoff", "hourly_drainage"):
+        state = hass.states.get(f"{ENTITY}_{suffix}")
+        assert state is not None, f"missing {suffix} — the chart would not render"
+        assert state.attributes.get("state_class") is None
+        with pytest.raises(ValueError):
+            float(state.state)
+        assert state.attributes["unit_of_measurement"] == "mm"
+
+    assert hass.states.get(ENTITY).attributes["hourly_export_through"] is not None
 
 
 async def test_recalculate_service_is_idempotent_and_reflects_new_data(

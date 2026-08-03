@@ -54,6 +54,21 @@ ALBEDO: Final = 0.23  # FAO-56 reference grass
 SERVICE_RECALCULATE: Final = "recalculate"
 SERVICE_RELOAD: Final = "reload"
 
+# --- Hourly statistics export ----------------------------------------------
+UNIT_MM: Final = "mm"
+
+# Entity-id suffixes of the per-hour series. They are shared on purpose: the
+# statistic_id we import into *is* the entity_id sensor.py builds from the same
+# suffix, so the two can never drift apart.
+SUFFIX_HOURLY_RAIN: Final = "hourly_rain"
+SUFFIX_HOURLY_RUNOFF: Final = "hourly_runoff"
+SUFFIX_HOURLY_DRAINAGE: Final = "hourly_drainage"
+HOURLY_SUFFIXES: Final = (
+    SUFFIX_HOURLY_RAIN,
+    SUFFIX_HOURLY_RUNOFF,
+    SUFFIX_HOURLY_DRAINAGE,
+)
+
 # --- Coordinator data attribute keys (sensor state attributes) -------------
 ATTR_DEFICIT: Final = "deficit"
 # Deprecated alias of -net_deficit, kept for Smart-Irrigation compatibility.
@@ -81,3 +96,6 @@ ATTR_LEAD_TIME: Final = "lead_time"
 ATTR_MAXIMUM_DURATION: Final = "maximum_duration"
 ATTR_MAXIMUM_DEFICIT: Final = "maximum_deficit"
 ATTR_EXPLANATION: Final = "explanation"
+# Newest hour the per-hour statistics export has covered, ISO-8601 or None. Lets
+# the export be inspected without opening the recorder database.
+ATTR_HOURLY_EXPORT_THROUGH: Final = "hourly_export_through"

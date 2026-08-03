@@ -191,6 +191,31 @@ cards it has to be a state, not an attribute. They all carry
 | `…_evapotranspiration` | mm | ETo × Kc summed over the window. |
 | `…_precipitation` | mm | Gauge rain over the window (gross). |
 | `…_rain_lost` | mm | Rain that never reached the roots: drained + run off. |
+| `…_hourly_rain` | mm | **Per hour**, gauge rain. State `unknown` by construction. |
+| `…_hourly_runoff` | mm | **Per hour**, rain shed by `max_infiltration_rate`. |
+| `…_hourly_drainage` | mm | **Per hour**, water pushed past field capacity. |
+
+**The three `hourly_*` entities have no state — that is deliberate.** Everything
+above is a *level*: a sum over the sliding window, correct as a curve but wrong
+as a bar, because the coordinator only samples it an hour after the rain fell,
+and a Home Assistant restart writes the same value again (which a column chart
+draws as a second, phantom shower). The `hourly_*` series instead go straight
+into the recorder's long-term statistics, each row stamped with the hour it
+actually belongs to. Read them as statistics, never as states:
+
+```yaml
+# apexcharts-card
+- entity: sensor.et_irrigator_lawn_hourly_rain
+  type: column
+  statistics:
+    type: change
+    period: hour
+```
+
+They keep a `sensor.` entity so charts can resolve them, but carry no
+`state_class` and no numeric state: with a `state_class` the recorder would
+compile competing statistics for the same id, and with a numeric state Home
+Assistant would raise a permanent `state_class_removed` repair.
 
 Sign convention: everything named *deficit* is a deficit, so **positive means the
 soil is dry**. The legacy `delta` attribute is the opposite sign (rain − ET), kept
@@ -213,8 +238,13 @@ for (seeing the raw balance), and it is why the run-time is not computed from it
 * **`max_infiltration_rate`** — the soil's intake rate in mm/h. The bucket already
   handles *volume*-driven runoff (rain on full soil), but not *intensity*-driven
   runoff: 35 mm in two hours mostly runs off even on dry soil. Sandy soils take
-  20-30 mm/h, loam ~10-15, clay under 5. Watch `…_rain_lost` after a storm to
-  calibrate. Leave it unset to count all gauge rain as infiltrating.
+  20-30 mm/h, loam ~10-15, clay under 5. Watch `…_hourly_runoff` after a storm to
+  calibrate — it isolates the intensity-driven half, which is the only part this
+  setting controls directly (`…_rain_lost` mixes it with volume-driven drainage).
+  Leave it unset to count all gauge rain as infiltrating; with no cap set,
+  `…_hourly_runoff` stays flat at zero, which is correct rather than broken.
+  Changing it takes effect on `et_irrigator.reload`, which also redraws the
+  runoff already published for the last `max_window_days`.
 * **Deep, infrequent watering** — this integration publishes a recommended
   run-time, not a schedule. To water deeply every few days instead of a trickle
   daily, gate your automation on the deficit, e.g.
@@ -246,6 +276,25 @@ for (seeing the raw balance), and it is why the run-time is not computed from it
   before the clamp, so drainage is under-counted, and `max_infiltration_rate` is
   applied as `rate × 24 h` and effectively never binds. Use the default `hourly`.
 * **No rain forecast.** Only recorded history.
+* **The hourly series reach back one window, and no further.** They are rebuilt
+  from `[now − max_window_days, now]`, so there is no backfill of history older
+  than that, and an hour's bar appears about an hour late — hour H is published
+  when the recorder compiles H's statistics, around H+1:12. The hour in progress
+  is never written, because its rain is still accumulating.
+* **Retuning `max_infiltration_rate` redraws runoff, not drainage.** Rain and
+  runoff are pure functions of the hour's mm and the cap, so they are recomputed
+  identically every time and safely rewritten. Drainage is path dependent — it
+  follows the bucket's trajectory, hence the window start — so each hour is
+  written once, from the balance that starts at the last irrigation, and never
+  revised. The cap still affects drainage indirectly (through what infiltrates),
+  but the signal to calibrate it is the runoff. The single hour an irrigation
+  *ends* in falls outside the balance and is recorded as drainage 0.
+* **Correcting a value by hand.** *Developer tools → Statistics* can adjust the
+  sum from a given hour onwards, which changes that one hour's bar. On
+  `…_hourly_drainage` the correction sticks, since that series is never
+  rewritten; on `…_hourly_rain` and `…_hourly_runoff` it is overwritten by the
+  next rewrite (restart, `reload`, `recalculate`) while the hour is still inside
+  `max_window_days`.
 
 ## Upgrading from 0.1.x
 
@@ -281,9 +330,10 @@ via `async_setup` + a YAML block, not Home Assistant's recommended UI config flo
   from the UI), config-entry features (diagnostics, repairs, reauth), and
   eligibility for **HA core** (core mandates config flow — HACS does not).
 * What we keep: entity `unique_id`s + device registry (renameable, customizable
-  entities), read-only recorder access via the recorder executor, and correct
-  `state_class`/`device_class` for statistics. The deviations are about the
-  *management surface*, not the calculation engine.
+  entities), recorder access through the recorder's own executor (all reads, plus
+  the per-hour statistics import), and correct `state_class`/`device_class` for
+  statistics. The deviations are about the *management surface*, not the
+  calculation engine.
 * Config changes apply without a restart via `et_irrigator.reload` (the standard
   reload helpers target the legacy `sensor: - platform:` style and don't fit this
   hub + discovery integration, so the reload is implemented manually).

@@ -1,8 +1,10 @@
 """Home Assistant long-term statistics + history access layer.
 
-Turns recorder statistics into the per-day aggregates consumed by ``calc.py`` and
-finds the end of the last irrigation for a zone. All recorder I/O is dispatched
-to the recorder's own executor (never the event loop).
+Turns recorder statistics into the per-day aggregates consumed by ``calc.py``,
+finds the end of the last irrigation for a zone, and writes our own per-hour
+series back into the recorder's long-term statistics. Every *reading* path is
+dispatched to the recorder's own executor (never the event loop); the write path
+is ``async_import_statistics``, which is a callback that only queues a job.
 """
 
 from __future__ import annotations
@@ -15,7 +17,13 @@ from functools import partial
 from typing import Any
 
 from homeassistant.components.recorder import get_instance, history
-from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.components.recorder.const import DOMAIN as RECORDER_DOMAIN
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    get_last_statistics,
+    statistics_during_period,
+)
 from homeassistant.const import UnitOfSpeed, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -44,6 +52,21 @@ def _row_start(row: dict[str, Any]) -> datetime:
     if isinstance(start, (int, float)):
         return dt_util.utc_from_timestamp(start)
     return start
+
+
+def slice_stats(
+    stats: dict[str, list[dict[str, Any]]], since: datetime
+) -> dict[str, list[dict[str, Any]]]:
+    """Drop the rows older than ``since`` from every series.
+
+    The fetch spans the full export window while the water balance only runs from
+    the end of the last irrigation, so the balance-facing builders get a sliced
+    copy and behave exactly as they did when the fetch itself was narrower.
+    """
+    return {
+        entity_id: [row for row in rows if _row_start(row) >= since]
+        for entity_id, rows in stats.items()
+    }
 
 
 def _mean(values: list[float]) -> float | None:
@@ -213,6 +236,7 @@ def build_hours(
                 wind_height=wind_height,
                 dewpoint=dewpoint,
                 precipitation_mm=precip if precip is not None else 0.0,
+                start=start,
             )
         )
     return hours
@@ -288,3 +312,175 @@ def build_days(
             )
         )
     return days
+
+
+# ---------------------------------------------------------------------------
+# Writing our own per-hour series into the long-term statistics.
+#
+# Why import statistics at all instead of publishing a state: the coordinator
+# only learns how many mm fell during hour H once the recorder has compiled H's
+# statistics, at ~H+1:12. A *state* written then is timestamped then, so the bar
+# lands an hour late — and a Home Assistant restart writes a fresh state row with
+# an unchanged value, which a column chart draws as a second, phantom rainfall.
+# `async_import_statistics` is the only mechanism that can write a value stamped
+# at hour H after hour H is over, and it upserts on (statistic_id, start), so a
+# restart updates rows instead of adding them.
+#
+# The entities behind these ids deliberately have `state_class = None` and no
+# numeric state; see sensor.py for why both halves of that are required.
+# ---------------------------------------------------------------------------
+
+
+def _statistic_metadata(statistic_id: str, unit: str) -> StatisticMetaData:
+    """Metadata for one of our imported per-hour series.
+
+    ``source`` must be the recorder's own domain: that is what
+    `async_import_statistics` accepts for a real ``sensor.*`` entity id.
+    """
+    return StatisticMetaData(
+        has_mean=False,
+        has_sum=True,
+        name=None,
+        source=RECORDER_DOMAIN,
+        statistic_id=statistic_id,
+        unit_of_measurement=unit,
+    )
+
+
+async def _async_stored_sums(
+    hass: HomeAssistant, statistic_id: str, start: datetime, end: datetime
+) -> list[tuple[datetime, float]]:
+    """Existing (hour, cumulative sum) rows for a statistic, oldest first."""
+    rows = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        start,
+        end,
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    return [
+        (_row_start(row), row["sum"])
+        for row in rows.get(statistic_id, [])
+        if row.get("sum") is not None
+    ]
+
+
+async def _async_last_sum_before(
+    hass: HomeAssistant, statistic_id: str, before: datetime
+) -> float | None:
+    """Cumulative sum of the newest stored row older than ``before``, if any.
+
+    Only used when the bounded look-back found nothing, to tell a genuine first
+    run apart from a gap longer than that look-back (Home Assistant down for
+    days, or ``max_window_days`` widened in YAML). Restarting the cumulative at 0
+    in the latter case would push every later sum down and produce one large
+    negative ``change`` at the junction — exactly the kind of phantom bar this
+    module exists to remove.
+
+    `get_last_statistics` is not usable as the normal anchor: it returns the most
+    recent row overall, which sits *inside* the window we are about to rewrite.
+    """
+    rows = await get_instance(hass).async_add_executor_job(
+        get_last_statistics, hass, 1, statistic_id, False, {"sum"}
+    )
+    for row in rows.get(statistic_id, []):
+        if row.get("sum") is not None and _row_start(row) < before:
+            return row["sum"]
+    return None
+
+
+async def async_export_hourly_series(
+    hass: HomeAssistant,
+    statistic_id: str,
+    unit: str,
+    series: list[tuple[datetime, float]],
+    *,
+    cutoff: datetime,
+    rewrite: bool,
+) -> datetime | None:
+    """Publish ``series`` as hourly long-term statistics; return the newest hour stored.
+
+    ``series`` is ``(UTC hour start, value during that hour)``. Values are turned
+    into a running cumulative because Home Assistant derives a per-hour figure as
+    ``change = sum[h] - sum[h-1]``; the chart reads ``change``, never the state.
+
+    One row is emitted for **every** hour of the series, zeros included. A dense
+    series is what lets the chart plot bars straight from ``change`` without any
+    bucketing of its own.
+
+    ``cutoff`` is the top of the current hour, exclusive: the in-progress hour is
+    never written, because its rain is still accumulating.
+
+    ``rewrite`` re-emits the whole series from an anchor taken *before* it;
+    otherwise only the hours after the newest stored one are appended (which also
+    covers first runs and fills gaps, since "everything after nothing" is
+    everything).
+
+    Rewriting is safe because every exported quantity is ``>= 0``: a rewrite can
+    only raise a cumulative, never lower it, so ``sum`` stays non-decreasing and
+    ``change`` can never go negative. Callers must only pass path-dependent
+    quantities (drainage) with ``rewrite=False``, since for those the same clock
+    hour can legitimately yield a different value from a shifted window.
+    """
+    hours = sorted((start, value) for start, value in series if start < cutoff)
+    if not hours:
+        return None
+
+    series_start = hours[0][0]
+    stored = await _async_stored_sums(
+        hass, statistic_id, series_start - timedelta(days=1), cutoff
+    )
+
+    newest_stored = stored[-1][0] if stored else None
+    if rewrite:
+        earlier = [row for row in stored if row[0] < series_start]
+        anchor = earlier[-1][1] if earlier else None
+        pending = hours
+    else:
+        anchor = stored[-1][1] if stored else None
+        pending = (
+            hours
+            if newest_stored is None
+            else [row for row in hours if row[0] > newest_stored]
+        )
+
+    if anchor is None:
+        anchor = await _async_last_sum_before(hass, statistic_id, series_start)
+    total = anchor or 0.0
+
+    if not pending:
+        return newest_stored
+
+    # A fresh list every call: _async_import_statistics rewrites each dict's
+    # "start" in place and hands the very same object to the recorder queue.
+    stats: list[StatisticData] = []
+    for start, value in pending:
+        # Clamped at 0 so a rain gauge that resets (negative `change`) cannot
+        # pull the cumulative down and manufacture a negative bar.
+        total += max(value, 0.0)
+        # `state` is written alongside `sum` on purpose: the recorder's update
+        # path uses statistic.get(...), so any field left out of a re-import is
+        # stored as NULL rather than left alone.
+        stats.append(
+            StatisticData(start=start, state=round(total, 4), sum=round(total, 4))
+        )
+
+    async_import_statistics(hass, _statistic_metadata(statistic_id, unit), stats)
+
+    newest_written = pending[-1][0]
+    if newest_stored is None:
+        return newest_written
+    return max(newest_written, newest_stored)
+
+
+async def async_clear_hourly_series(hass: HomeAssistant, statistic_ids: list[str]) -> None:
+    """Drop imported series for zones that no longer exist.
+
+    Without this the statistics outlive the entity and `validate_statistics`
+    reports them as `no_state` forever.
+    """
+    if statistic_ids:
+        get_instance(hass).async_clear_statistics(statistic_ids)

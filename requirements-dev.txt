@@ -1,0 +1,19 @@
+# Development / test environment.
+#
+# Keep this pinned to the SAME Home Assistant version as the instance this is
+# deployed to. Developing against an older core is how a change to the recorder
+# statistics metadata contract (mean_type / unit_class, required from 2026.11)
+# went unnoticed locally: the tests passed against an HA that did not have it.
+#
+# pytest-homeassistant-custom-component pins homeassistant exactly, so the line
+# below is what selects the core version. To move to a new HA release, find the
+# matching harness version and bump this one line.
+#
+#   0.13.348 -> homeassistant 2026.7.4 (requires Python >= 3.14.2)
+#
+# Setup, without touching the system Python:
+#   uv python install 3.14
+#   uv venv --python 3.14 .venv
+#   uv pip install --python .venv/bin/python -r requirements-dev.txt
+#   .venv/bin/python -m pytest -q
+pytest-homeassistant-custom-component==0.13.348

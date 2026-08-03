@@ -18,8 +18,13 @@ from typing import Any
 
 from homeassistant.components.recorder import get_instance, history
 from homeassistant.components.recorder.const import DOMAIN as RECORDER_DOMAIN
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
 from homeassistant.components.recorder.statistics import (
+    STATISTIC_UNIT_TO_UNIT_CONVERTER,
     async_import_statistics,
     get_last_statistics,
     statistics_during_period,
@@ -336,13 +341,27 @@ def _statistic_metadata(statistic_id: str, unit: str) -> StatisticMetaData:
 
     ``source`` must be the recorder's own domain: that is what
     `async_import_statistics` accepts for a real ``sensor.*`` entity id.
+
+    ``mean_type`` and ``unit_class`` are both required. Home Assistant raises
+    outright on a missing ``mean_type``, and while it tolerates a missing
+    ``unit_class`` on the first insert, every later import of the same id goes
+    through the metadata *update* path, which reads the key directly and would
+    fail with a KeyError — so the series would be written once and then never
+    again. ``has_mean`` is deliberately absent: it is the deprecated spelling of
+    ``mean_type`` and carries no extra information.
+
+    ``unit_class`` is looked up rather than hardcoded so it matches whatever the
+    recorder itself would pick for this unit (mm -> "distance"), which is what
+    lets the statistics API convert the series for display.
     """
+    converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
     return StatisticMetaData(
-        has_mean=False,
         has_sum=True,
+        mean_type=StatisticMeanType.NONE,  # a sum-only series has no mean
         name=None,
         source=RECORDER_DOMAIN,
         statistic_id=statistic_id,
+        unit_class=converter.UNIT_CLASS if converter else None,
         unit_of_measurement=unit,
     )
 

@@ -344,10 +344,22 @@ via `async_setup` + a YAML block, not Home Assistant's recommended UI config flo
 ## Development
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install pytest-homeassistant-custom-component
-pytest -q
+uv python install 3.14
+uv venv --python 3.14 .venv
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+.venv/bin/python -m pytest -q
 ```
+
+**Pin the test environment to the Home Assistant version you deploy to.**
+`requirements-dev.txt` pins `pytest-homeassistant-custom-component`, which in
+turn pins `homeassistant` exactly; that one line is what selects the core
+version, and the core version is what dictates the Python version. Testing
+against an older core is how a change to the recorder's statistics metadata
+(`mean_type` / `unit_class`, required from HA 2026.11) passed unnoticed
+locally — the tests were green against a core that did not have it.
+`tests/test_export.py` now asserts our metadata against the installed
+`StatisticMetaData.__required_keys__`, so the next such change fails a test
+instead of a deployment.
 
 `custom_components/et_irrigator/calc.py` is pure (no HA imports) and is validated
 against the FAO-56 worked example in `tests/test_calc.py`.

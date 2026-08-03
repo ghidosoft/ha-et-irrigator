@@ -198,6 +198,31 @@ async def test_a_gauge_reset_cannot_produce_a_negative_bar(recorder_mock, hass):
     assert [round(ch, 4) for _, ch, _ in stored] == [1.0, 0.0, 2.0]
 
 
+def test_metadata_supplies_every_key_home_assistant_requires():
+    """Guard against the metadata contract drifting out from under us.
+
+    Home Assistant currently fills in `mean_type` and `unit_class` for callers
+    that omit them, warning that it will stop doing so in 2026.11. Asserting
+    against the installed TypedDict means a future required key fails here
+    rather than in production, and it is why the development environment is
+    pinned to the same Home Assistant version as the instance being deployed to.
+    """
+    from homeassistant.components.recorder.models import StatisticMetaData
+
+    from custom_components.et_irrigator.statistics import _statistic_metadata
+
+    meta = _statistic_metadata(STAT_ID, "mm")
+    missing = set(StatisticMetaData.__required_keys__) - set(meta)
+    assert not missing, f"metadata is missing required keys: {sorted(missing)}"
+
+    # mm is a distance for conversion purposes; this is what Home Assistant
+    # derives on its own, so we must not disagree with it.
+    assert meta["unit_class"] == "distance"
+    assert meta["unit_of_measurement"] == "mm"
+    assert meta["has_sum"] is True
+    assert meta["source"] == "recorder"
+
+
 async def test_an_empty_series_writes_nothing(recorder_mock, hass):
     assert await _export(hass, [], cutoff=BASE) is None
     assert await _read(hass) == []

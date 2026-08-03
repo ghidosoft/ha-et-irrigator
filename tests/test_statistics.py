@@ -3,7 +3,11 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
-from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.statistics import (
+    STATISTIC_UNIT_TO_UNIT_CONVERTER,
+    async_import_statistics,
+)
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
@@ -87,12 +91,17 @@ async def _import_hourly(hass, statistic_id, unit, value, hours):
         }
         for i in range(hours)
     ]
+    # A weather sensor as the recorder itself would record it: an arithmetic
+    # mean, and a unit_class so the km/h -> m/s conversion below has something
+    # to convert with.
+    converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
     metadata = {
-        "has_mean": True,
         "has_sum": False,
+        "mean_type": StatisticMeanType.ARITHMETIC,
         "name": None,
         "source": "recorder",
         "statistic_id": statistic_id,
+        "unit_class": converter.UNIT_CLASS if converter else None,
         "unit_of_measurement": unit,
     }
     async_import_statistics(hass, metadata, stats)

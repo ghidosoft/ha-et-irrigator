@@ -44,7 +44,10 @@ DEFAULT_WIND_SPEED: Final = 2.0  # m/s, FAO-56 default when wind data is missing
 DEFAULT_CROP_COEFFICIENT: Final = 1.0
 DEFAULT_MAX_WINDOW_DAYS: Final = 7
 DEFAULT_MAXIMUM_DEFICIT: Final = 30.0  # mm (TAW: total available water in root zone)
-DEFAULT_MAX_INFILTRATION_RATE: Final = None  # mm/h, None = all gauge rain infiltrates
+# max_infiltration_rate has no default constant on purpose: the schema declares it
+# vol.Optional with no `default=`, so an unset cap is *absent* from the validated
+# config and read back as None via .get(). ZoneCalcConfig.max_infiltration_rate
+# then defaults to None, which run_water_balance reads as "no cap".
 DEFAULT_MULTIPLIER: Final = 1.0
 DEFAULT_LEAD_TIME: Final = 0  # seconds
 DEFAULT_MAXIMUM_DURATION: Final = -1  # seconds, -1 = no cap

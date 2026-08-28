@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import pyeto
-from .const import ALBEDO
+from .const import ALBEDO, HARGREAVES_RADIATION_ADJ
 
 
 @dataclass
@@ -46,7 +46,10 @@ class DayData:
     day_of_year: int
     t_min: float | None
     t_max: float | None
-    solar_rad_mj: float
+    # Measured solar radiation [MJ m-2 day-1], or None when the day holds no usable
+    # reading (sensor stuck) and Rs must be estimated from the temperature range.
+    # 0.0 is a genuine measured zero and is honoured as such.
+    solar_rad_mj: float | None
     wind_speed: float
     t_mean: float | None = None
     wind_height: float = 2.0
@@ -257,6 +260,31 @@ def run_water_balance(
     )
 
 
+def sol_rad_from_temp_range(
+    ra: float, elevation: float, t_min: float | None, t_max: float | None
+) -> float:
+    """Estimate Rs [MJ m-2 per period] from the temperature range — FAO-56 Eq. 50.
+
+    The Hargreaves radiation formula, which FAO-56 prescribes precisely when
+    measured solar radiation is missing: a wide day swing means a clear sky, a
+    narrow one means cloud. It is linear in ``ra``, so feeding it the *hourly*
+    extraterrestrial radiation yields the same total as the daily form spread over
+    the day's hours — one function therefore serves both ET methods.
+
+    Returns 0.0 with the sun down (``ra`` <= 0) or the range unusable, and is capped
+    at clear-sky radiation so a wide swing cannot invent more energy than the
+    atmosphere can deliver.
+
+    ``pyeto.sol_rad_from_t`` implements the same equation but applies that cap as
+    ``np.min(sol_rad, cs_rad)``, which reads its second argument as an *axis* and
+    raises ``TypeError`` on scalars. Hence the local implementation.
+    """
+    if ra <= 0 or t_min is None or t_max is None or t_max <= t_min:
+        return 0.0
+    rs = HARGREAVES_RADIATION_ADJ * math.sqrt(t_max - t_min) * ra
+    return min(rs, pyeto.cs_rad(elevation, ra))
+
+
 def _actual_vapour_pressure(day: DayData) -> float:
     """Actual vapour pressure [kPa], best available source (FAO-56 priority)."""
     if day.dewpoint is not None:
@@ -300,13 +328,17 @@ def eto_fao56_day(day: DayData, latitude: float, elevation: float) -> float:
     extra_rad = pyeto.et_rad(lat_rad, sol_dec, sha, ird)
     clear_sky_rad = pyeto.cs_rad(elevation, extra_rad)
 
-    ni_sw_rad = pyeto.net_in_sol_rad(day.solar_rad_mj, albedo=ALBEDO)
+    sol_rad = day.solar_rad_mj
+    if sol_rad is None:
+        sol_rad = sol_rad_from_temp_range(extra_rad, elevation, tmin, tmax)
+
+    ni_sw_rad = pyeto.net_in_sol_rad(sol_rad, albedo=ALBEDO)
     # net_out_lw_rad applies the Stefan-Boltzmann law: temperatures MUST be in
     # Kelvin. Passing Celsius collapses the longwave term to ~0 and inflates ETo.
     no_lw_rad = pyeto.net_out_lw_rad(
         pyeto.celsius2kelvin(tmin),
         pyeto.celsius2kelvin(tmax),
-        day.solar_rad_mj,
+        sol_rad,
         clear_sky_rad,
         avp,
     )
@@ -430,7 +462,10 @@ class HourData:
     # Mean hourly temperature [deg C], or None for an hour with rain statistics but
     # no temperature statistics (recorder gap) -> ETo 0, rain still counted.
     t: float | None
-    solar_rad_mj: float  # hourly solar radiation total, MJ m-2 h-1
+    # Measured hourly solar radiation total [MJ m-2 h-1], or None when the hour holds
+    # no usable reading (sensor stuck) and Rs must be estimated from the temperature
+    # range. 0.0 is a genuine measured zero and is honoured as such.
+    solar_rad_mj: float | None
     wind_speed: float  # m s-1
     wind_height: float = 2.0
     dewpoint: float | None = None
@@ -439,6 +474,11 @@ class HourData:
     # nothing in this module reads it, and ``datetime`` is stdlib, so the
     # "no Home Assistant dependencies" contract above still holds.
     start: datetime | None = None
+    # The parent day's temperature range, carried only to feed the Rs estimate when
+    # ``solar_rad_mj`` is None: Hargreaves is a daily formula, so an hour cannot
+    # supply its own range.
+    t_min_day: float | None = None
+    t_max_day: float | None = None
 
 
 def ra_hourly(latitude: float, day_of_year: int, solar_time_hours: float,
@@ -486,12 +526,15 @@ def eto_fao56_hourly(hour: HourData, latitude: float, elevation: float) -> float
 
     ra = ra_hourly(latitude, hour.day_of_year, hour.solar_time_hours)
     rso = pyeto.cs_rad(elevation, ra) if ra > 0 else 0.0
-    ni_sw = pyeto.net_in_sol_rad(hour.solar_rad_mj, albedo=ALBEDO)
+    sol_rad = hour.solar_rad_mj
+    if sol_rad is None:
+        sol_rad = sol_rad_from_temp_range(ra, elevation, hour.t_min_day, hour.t_max_day)
+    ni_sw = pyeto.net_in_sol_rad(sol_rad, albedo=ALBEDO)
     t_k = pyeto.celsius2kelvin(t)
     if rso > 0:
         # Reuse the daily longwave with tmin=tmax=T_hr (so (T^4+T^4)/2 = T^4)
         # and /24 to turn the daily Stefan-Boltzmann constant into the hourly one.
-        no_lw = pyeto.net_out_lw_rad(t_k, t_k, hour.solar_rad_mj, rso, ea) / 24.0
+        no_lw = pyeto.net_out_lw_rad(t_k, t_k, sol_rad, rso, ea) / 24.0
     else:
         # Night: Rs/Rso is undefined; use a representative cloudiness factor.
         sigma_hr = pyeto.STEFAN_BOLTZMANN_CONSTANT / 24.0

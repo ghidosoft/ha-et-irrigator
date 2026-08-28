@@ -34,7 +34,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .calc import DayData, HourData
-from .const import DEFAULT_WIND_SPEED
+from .const import DEFAULT_WIND_SPEED, SOLAR_STUCK_MIN_HOURS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -158,6 +158,89 @@ def _warn_if_rain_not_cumulative(
             )
 
 
+def _warn_if_solar_stuck(
+    solar_id: str | None, stuck: set[int], index: dict[int, dict[str, Any]]
+) -> None:
+    """Report a stuck pyranometer: it is silent everywhere else.
+
+    Only runs pinned above the window's darkest value are reported — a run at the
+    dark offset is just night, which every window contains.
+    """
+    if not solar_id or not stuck:
+        return
+    floor = min(
+        (r["mean"] for r in index.values() if r.get("mean") is not None), default=None
+    )
+    lit = [k for k in stuck if floor is not None and (index[k].get("mean") or 0.0) > floor]
+    if not lit:
+        return
+    _LOGGER.warning(
+        "ET Irrigator: solar sensor '%s' reports %d hour(s) frozen at a single value "
+        "(from %s). Those hours fall back to the FAO-56 temperature-range estimate; "
+        "check the sensor",
+        solar_id,
+        len(lit),
+        dt_util.utc_from_timestamp(min(lit)).isoformat(),
+    )
+
+
+def _stuck_hours(index: dict[int, dict[str, Any]]) -> set[int]:
+    """Hour keys whose row is a carried-forward state rather than a measurement.
+
+    A statistics row with ``min == max`` never moved for the whole hour. Real
+    irradiance never does that under daylight, so a run of consecutive hours pinned
+    to one identical value marks the span where the sensor stopped reporting and HA
+    kept republishing its last state — the entity stays available and the recorder
+    keeps compiling rows, which is exactly why this is invisible from the state.
+
+    Night is pinned too, at the sensor's dark offset, and is reported as stuck like
+    any other run. That is harmless: the substitute for a dark hour is 0 anyway
+    because the extraterrestrial radiation is 0. Callers that need to tell the two
+    apart (the daily method) compare against the day's own floor.
+
+    One isolated hour is not enough — an overcast hour can legitimately sit still —
+    hence ``SOLAR_STUCK_MIN_HOURS``.
+    """
+    stuck: set[int] = set()
+    run: list[int] = []
+
+    def flush() -> None:
+        if len(run) >= SOLAR_STUCK_MIN_HOURS:
+            stuck.update(run)
+
+    previous: int | None = None
+    for key in sorted(index):
+        row = index[key]
+        low, high = row.get("min"), row.get("max")
+        pinned = low is not None and high is not None and low == high
+        # A recorder gap breaks the run: two pinned hours either side of a hole are
+        # not evidence that the sensor sat still through it.
+        contiguous = previous is not None and key - previous == _HOUR_SECONDS
+        if pinned and contiguous and run and row.get("mean") == index[run[-1]].get("mean"):
+            run.append(key)
+        else:
+            flush()
+            run = [key] if pinned else []
+        previous = key
+    flush()
+    return stuck
+
+
+def _daily_temp_range(
+    temp_index: dict[int, dict[str, Any]]
+) -> dict[Any, tuple[float | None, float | None]]:
+    """Local date -> (min, max) temperature, to feed the Rs fallback per hour."""
+    low: dict[Any, float] = {}
+    high: dict[Any, float] = {}
+    for key, row in temp_index.items():
+        day = dt_util.as_local(dt_util.utc_from_timestamp(key)).date()
+        if (value := row.get("min")) is not None:
+            low[day] = min(low[day], value) if day in low else value
+        if (value := row.get("max")) is not None:
+            high[day] = max(high[day], value) if day in high else value
+    return {day: (low.get(day), high.get(day)) for day in set(low) | set(high)}
+
+
 def _solar_time_hours(
     midpoint_utc: datetime, longitude: float, day_of_year: int
 ) -> float:
@@ -209,6 +292,10 @@ def build_hours(
 
     _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
 
+    solar_stuck = _stuck_hours(solar_ix)
+    temp_range = _daily_temp_range(temp_ix)
+    _warn_if_solar_stuck(sensors.get("solar_radiation"), solar_stuck, solar_ix)
+
     hours: list[HourData] = []
     for key in sorted(set(temp_ix) | set(rain_ix)):
         temp_row = temp_ix.get(key)
@@ -223,7 +310,15 @@ def build_hours(
 
         solar_row = solar_ix.get(key)
         solar_mean = solar_row.get("mean") if solar_row else None
-        solar_mj = (solar_mean or 0.0) * _HOUR_SECONDS / 1_000_000.0
+        # None, not 0.0: a missing or stuck row is "no reading", which eto_fao56_hourly
+        # replaces with the FAO-56 temperature-range estimate. Zeroing it here would
+        # under-state ET as silently as the stuck value over-states it.
+        solar_mj = (
+            None
+            if solar_mean is None or key in solar_stuck
+            else solar_mean * _HOUR_SECONDS / 1_000_000.0
+        )
+        t_min_day, t_max_day = temp_range.get(dt_util.as_local(start).date(), (None, None))
 
         dew_row = dew_ix.get(key)
         dewpoint = dew_row.get("mean") if dew_row else None
@@ -242,6 +337,8 @@ def build_hours(
                 dewpoint=dewpoint,
                 precipitation_mm=precip if precip is not None else 0.0,
                 start=start,
+                t_min_day=t_min_day,
+                t_max_day=t_max_day,
             )
         )
     return hours
@@ -279,6 +376,13 @@ def build_days(
 
     _warn_if_rain_not_cumulative(stats, sensors.get("rain"))
 
+    solar_ix = {
+        int(_row_start(row).timestamp()): row
+        for row in stats.get(sensors.get("solar_radiation") or "", [])
+    }
+    solar_stuck = _stuck_hours(solar_ix)
+    _warn_if_solar_stuck(sensors.get("solar_radiation"), solar_stuck, solar_ix)
+
     days: list[DayData] = []
     for day in sorted(set(temp_by_day) | set(rain_by_day)):
         temp_rows = temp_by_day.get(day, [])
@@ -291,10 +395,33 @@ def build_days(
         wind_mean = _mean([r.get("mean") for r in wind_by_day.get(day, [])])
         wind = wind_mean if wind_mean is not None else DEFAULT_WIND_SPEED
 
-        solar_mj = sum(
-            (r["mean"] * _HOUR_SECONDS / 1_000_000.0)
-            for r in solar_by_day.get(day, [])
-            if r.get("mean") is not None
+        solar_rows = solar_by_day.get(day, [])
+        # A daily total is only a measurement if all of its hours were. Unlike the
+        # hourly method, which can replace single hours, the day is all-or-nothing:
+        # summing the surviving hours would pass off a partial total as a full one.
+        # The dark offset is excluded by comparing against the day's own floor —
+        # every day has a pinned night, and that is not a fault.
+        solar_floor = min(
+            (r["mean"] for r in solar_rows if r.get("mean") is not None), default=None
+        )
+        day_stuck = solar_floor is not None and any(
+            int(_row_start(r).timestamp()) in solar_stuck
+            and r.get("mean") is not None
+            and r["mean"] > solar_floor
+            for r in solar_rows
+        )
+        # ``solar_floor is None`` means the day has no usable row at all — no solar
+        # sensor configured, or an all-day recorder gap. That is "no reading", the
+        # same as a stuck day; summing to 0.0 would report a pitch-black day and
+        # under-state ET, where ``build_hours`` already estimates those hours.
+        solar_mj = (
+            None
+            if day_stuck or solar_floor is None
+            else sum(
+                (r["mean"] * _HOUR_SECONDS / 1_000_000.0)
+                for r in solar_rows
+                if r.get("mean") is not None
+            )
         )
 
         dewpoint = _mean([r.get("mean") for r in dew_by_day.get(day, [])])

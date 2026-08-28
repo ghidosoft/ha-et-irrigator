@@ -52,6 +52,13 @@ DEFAULT_MULTIPLIER: Final = 1.0
 DEFAULT_LEAD_TIME: Final = 0  # seconds
 DEFAULT_MAXIMUM_DURATION: Final = -1  # seconds, -1 = no cap
 ALBEDO: Final = 0.23  # FAO-56 reference grass
+# Adjustment coefficient of the Hargreaves radiation formula (FAO-56 Eq. 50), which
+# estimates Rs from the temperature range when the pyranometer has no usable
+# reading. 0.16 is the 'interior' value; coastal sites use 0.19.
+HARGREAVES_RADIATION_ADJ: Final = 0.16
+# Consecutive hourly rows pinned to one value before the solar sensor is called
+# stuck rather than merely steady — see statistics.py:_stuck_hours.
+SOLAR_STUCK_MIN_HOURS: Final = 2
 
 # --- Services --------------------------------------------------------------
 SERVICE_RECALCULATE: Final = "recalculate"

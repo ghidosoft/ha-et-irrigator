@@ -254,3 +254,151 @@ def test_build_days_keeps_rain_only_days():
     assert len(days) == 2
     assert days[1].t_min is None and days[1].t_max is None
     assert abs(days[1].precipitation_mm - 12.0) < 1e-9  # 3 hours * 4.0
+
+
+# --- Stuck solar sensor (carried-forward state) ----------------------------
+
+def _solar_rows(values, *, base=None, skip=()):
+    """Hourly solar rows from (mean, min, max) triples; `skip` drops hour indices."""
+    base = base or datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+    return [
+        {"start": base + timedelta(hours=i), "mean": m, "min": lo, "max": hi}
+        for i, (m, lo, hi) in enumerate(values)
+        if i not in skip
+    ]
+
+
+def _solar_sensors():
+    return {
+        "temperature": "sensor.t",
+        "wind_speed": None,
+        "solar_radiation": "sensor.s",
+        "dewpoint": None,
+        "rain": None,
+    }
+
+
+def _temp_rows(n, *, base=None):
+    base = base or datetime(2026, 8, 28, 10, 0, tzinfo=timezone.utc)
+    return [
+        {"start": base + timedelta(hours=i), "mean": 28.0, "min": 22.0, "max": 33.0}
+        for i in range(n)
+    ]
+
+
+def test_build_hours_marks_a_stuck_solar_run_unknown():
+    """The real failure: a pyranometer pinned to one value for hours.
+
+    HA keeps republishing the last state, so the entity never goes unavailable and
+    the recorder keeps compiling rows — min == max is the only trace left.
+    """
+    stats = {
+        "sensor.t": _temp_rows(4),
+        "sensor.s": _solar_rows(
+            [
+                (661.17, 349.57, 788.24),  # still measuring
+                (743.16, 743.16, 743.16),  # sensor stops here
+                (743.16, 743.16, 743.16),
+                (743.16, 743.16, 743.16),
+            ]
+        ),
+    }
+    hours = build_hours(stats, _solar_sensors(), wind_height=2.0, longitude=10.0)
+    assert hours[0].solar_rad_mj is not None
+    assert [h.solar_rad_mj for h in hours[1:]] == [None, None, None]
+
+
+def test_build_hours_keeps_a_single_pinned_hour():
+    """One still hour is overcast weather, not a fault."""
+    stats = {
+        "sensor.t": _temp_rows(3),
+        "sensor.s": _solar_rows(
+            [(120.0, 80.0, 160.0), (95.0, 95.0, 95.0), (140.0, 90.0, 190.0)]
+        ),
+    }
+    hours = build_hours(stats, _solar_sensors(), wind_height=2.0, longitude=10.0)
+    assert all(h.solar_rad_mj is not None for h in hours)
+
+
+def test_build_hours_does_not_span_a_recorder_gap():
+    """Two pinned hours either side of a hole are not one stuck run."""
+    stats = {
+        "sensor.t": _temp_rows(4),
+        # hour index 1 is missing from the solar series entirely
+        "sensor.s": _solar_rows(
+            [
+                (500.0, 500.0, 500.0),
+                (0.0, 0.0, 0.0),
+                (500.0, 500.0, 500.0),
+                (300.0, 120.0, 480.0),
+            ],
+            skip=(1,),
+        ),
+    }
+    hours = build_hours(stats, _solar_sensors(), wind_height=2.0, longitude=10.0)
+    # index 1 has no row at all -> unknown; the two pinned survivors stay measurements
+    assert [h.solar_rad_mj is None for h in hours] == [False, True, False, False]
+
+
+def test_build_hours_carries_the_daily_temperature_range():
+    """The Eq. 50 fallback is a daily formula: every hour needs its day's swing."""
+    stats = {"sensor.t": _temp_rows(3), "sensor.s": []}
+    hours = build_hours(stats, _solar_sensors(), wind_height=2.0, longitude=10.0)
+    assert all(h.t_min_day == 22.0 and h.t_max_day == 33.0 for h in hours)
+
+
+def test_build_hours_low_stuck_run_is_caught_too():
+    """The other half of the same fault: pinned near zero through a sunlit morning."""
+    stats = {
+        "sensor.t": _temp_rows(3),
+        "sensor.s": _solar_rows([(0.42, 0.42, 0.42)] * 3),
+    }
+    hours = build_hours(stats, _solar_sensors(), wind_height=2.0, longitude=10.0)
+    assert all(h.solar_rad_mj is None for h in hours)
+
+
+def test_build_days_marks_a_day_with_a_stuck_run_unknown():
+    """A daily total is all-or-nothing: a partial sum would pass for a full one."""
+    stats = {
+        "sensor.t": _temp_rows(4),
+        "sensor.s": _solar_rows(
+            [
+                (661.17, 349.57, 788.24),
+                (743.16, 743.16, 743.16),
+                (743.16, 743.16, 743.16),
+                (743.16, 743.16, 743.16),
+            ]
+        ),
+    }
+    days = build_days(stats, _solar_sensors(), wind_height=2.0)
+    assert days and days[0].solar_rad_mj is None
+
+
+def test_build_days_ignores_a_pinned_night():
+    """Every day has a still, dark run — that is not a stuck sensor."""
+    stats = {
+        "sensor.t": _temp_rows(5),
+        "sensor.s": _solar_rows(
+            [
+                (0.03, 0.03, 0.03),  # night
+                (0.03, 0.03, 0.03),
+                (0.03, 0.03, 0.03),
+                (120.0, 40.0, 260.0),  # sunrise, moving again
+                (400.0, 260.0, 610.0),
+            ]
+        ),
+    }
+    days = build_days(stats, _solar_sensors(), wind_height=2.0)
+    assert days and days[0].solar_rad_mj is not None
+    assert days[0].solar_rad_mj > 0.0
+
+
+def test_build_days_with_no_solar_rows_is_unknown_not_zero():
+    """No solar sensor (or an all-day gap) is "no reading", not a pitch-black day.
+
+    ``build_hours`` already estimates those hours from the temperature range; the
+    daily method must not diverge by summing an empty list to 0.0.
+    """
+    stats = {"sensor.t": _temp_rows(4), "sensor.s": []}
+    days = build_days(stats, _solar_sensors(), wind_height=2.0)
+    assert days and days[0].solar_rad_mj is None

@@ -14,6 +14,7 @@ from custom_components.et_irrigator.calc import (
     eto_fao56_hourly,
     ra_hourly,
     run_water_balance,
+    sol_rad_from_temp_range,
     step_cap,
     step_infiltration,
 )
@@ -510,3 +511,73 @@ def test_duration_uses_precipitation_rate():
     # 24 mm/h direct, deficit 6 mm -> 6/24*3600 = 900 s
     cfg = ZoneCalcConfig(latitude=45, elevation=160, precipitation_rate=24.0)
     assert duration_seconds(6.0, cfg) == 900
+
+
+# --- Missing solar radiation (FAO-56 Eq. 50 fallback) ----------------------
+
+def test_sol_rad_estimate_is_zero_without_sun_or_range():
+    """No extraterrestrial radiation, or no usable range, means no estimate."""
+    ra_noon = ra_hourly(45.0, 196, 12.5)
+    assert sol_rad_from_temp_range(0.0, 160.0, 18.0, 30.0) == 0.0  # night
+    assert sol_rad_from_temp_range(ra_noon, 160.0, None, 30.0) == 0.0
+    assert sol_rad_from_temp_range(ra_noon, 160.0, 30.0, 30.0) == 0.0  # flat day
+
+
+def test_sol_rad_estimate_is_capped_at_clear_sky():
+    """An absurd temperature range cannot invent more energy than the sky holds."""
+    ra = ra_hourly(45.0, 196, 12.5)
+    assert sol_rad_from_temp_range(ra, 160.0, 0.0, 90.0) == pyeto.cs_rad(160.0, ra)
+
+
+def test_sol_rad_estimate_tracks_the_temperature_range():
+    """A wide swing reads as a clear sky, a narrow one as cloud."""
+    ra = ra_hourly(45.0, 196, 12.5)
+    clear = sol_rad_from_temp_range(ra, 160.0, 15.0, 33.0)
+    cloudy = sol_rad_from_temp_range(ra, 160.0, 19.0, 23.0)
+    assert 0.0 < cloudy < clear <= pyeto.cs_rad(160.0, ra)
+
+
+def test_hourly_missing_solar_at_night_costs_nothing():
+    """The regression: a sensor stuck at midday irradiance must not water at 02:00.
+
+    A frozen 743 W/m² reported through the night inflates ETo by ~0.5 mm *per dark
+    hour*; marking the hour unknown falls back to Eq. 50, which is 0 while Ra is 0.
+    """
+    frozen = _solar_hour(2.0, t=24.0, solar_rad_mj=743.16 * 3600 / 1e6)
+    unknown = _solar_hour(2.0, t=24.0, solar_rad_mj=None, t_min_day=21.0, t_max_day=33.0)
+    dark = _solar_hour(2.0, t=24.0, solar_rad_mj=0.0)
+    # Ra is 0 at 02:00, so the estimate is exactly a dark hour: what is left is the
+    # aerodynamic term, which is real ET and must survive.
+    assert eto_fao56_hourly(unknown, 45.0, 160.0) == eto_fao56_hourly(dark, 45.0, 160.0)
+    assert eto_fao56_hourly(frozen, 45.0, 160.0) > 10 * eto_fao56_hourly(unknown, 45.0, 160.0)
+
+
+def test_hourly_missing_solar_at_noon_lands_between_dark_and_clear():
+    """A daylight hour with no reading is estimated, not zeroed."""
+    unknown = _solar_hour(12.5, t=30.0, solar_rad_mj=None, t_min_day=18.0, t_max_day=32.0)
+    dark = _solar_hour(12.5, t=30.0, solar_rad_mj=0.0)
+    clear = _solar_hour(
+        12.5, t=30.0, solar_rad_mj=pyeto.cs_rad(160.0, ra_hourly(45.0, 196, 12.5))
+    )
+    estimated = eto_fao56_hourly(unknown, 45.0, 160.0)
+    assert eto_fao56_hourly(dark, 45.0, 160.0) < estimated < eto_fao56_hourly(clear, 45.0, 160.0)
+
+
+def test_hourly_measured_zero_is_not_treated_as_missing():
+    """0.0 is a reading — an overcast hour must stay overcast, not get an estimate."""
+    measured = _solar_hour(12.5, t=30.0, solar_rad_mj=0.0, t_min_day=18.0, t_max_day=32.0)
+    unknown = _solar_hour(12.5, t=30.0, solar_rad_mj=None, t_min_day=18.0, t_max_day=32.0)
+    assert eto_fao56_hourly(measured, 45.0, 160.0) < eto_fao56_hourly(unknown, 45.0, 160.0)
+
+
+def test_daily_missing_solar_is_estimated_from_the_range():
+    """The daily method takes the same fallback, and stays between cloud and clear."""
+    unknown = eto_fao56_day(_summer_day(solar_rad_mj=None), 45.0, 160.0)
+    dark = eto_fao56_day(_summer_day(solar_rad_mj=0.0), 45.0, 160.0)
+    clear = eto_fao56_day(_summer_day(solar_rad_mj=30.0), 45.0, 160.0)
+    assert dark < unknown < clear
+
+
+def test_daily_estimate_recovers_a_plausible_summer_eto():
+    """Eq. 50 on a real mid-July swing must land in the usual 3-7 mm/day band."""
+    assert 3.0 < eto_fao56_day(_summer_day(solar_rad_mj=None), 45.0, 160.0) < 7.0

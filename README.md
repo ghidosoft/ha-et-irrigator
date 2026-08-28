@@ -118,7 +118,11 @@ et_irrigator:
 ```
 
 All weather channels except `temperature` are optional, but **solar radiation is
-strongly recommended** — without it the FAO-56 net-radiation term degrades.
+strongly recommended** — a measured pyranometer is always better than the estimate
+that replaces it. When a reading is missing, Rs is estimated from the day's
+temperature range (FAO-56 Eq. 50, the Hargreaves radiation formula: a wide swing
+means a clear sky, a narrow one cloud), capped at clear-sky radiation. See
+*Missing or stuck solar radiation* below.
 
 **Application rate per zone.** Each zone needs to know how fast it applies water
 (mm/h). Provide it either way:
@@ -172,6 +176,38 @@ radiation and rain are read natively and must already be in `W/m²` and `mm`.
 Both use your measured solar radiation. Over full days they agree within a few
 percent (hourly-summed is typically a touch lower and is considered more accurate
 under variable conditions).
+
+### Missing or stuck solar radiation
+
+A pyranometer that stops reporting is not the same as one reporting darkness, and
+Home Assistant hides the difference: the entity keeps its last state, stays
+`available`, and the recorder keeps compiling statistics rows. A sensor frozen at a
+midday 743 W/m² therefore reports full sun *through the night*, inflating ETo by
+roughly 0.5 mm for every dark hour.
+
+Two defences:
+
+* **A hall-of-mirrors row is detected.** A statistics row with `min == max` never
+  moved for the whole hour. Two or more *consecutive* hours pinned to the same
+  identical value are treated as a carried-forward state, not a measurement. One
+  isolated still hour is left alone — that is legitimately overcast weather. A
+  recorder gap breaks the run.
+* **Those hours, and any hour with no row at all, fall back to FAO-56 Eq. 50**,
+  which estimates Rs from the day's temperature range and is exactly what FAO-56
+  prescribes when measured radiation is unavailable. At night the estimate is 0,
+  because the extraterrestrial radiation is — so a stuck sensor no longer waters at
+  02:00.
+
+A measured `0.0` is a reading and is honoured as such; only *unknown* hours are
+estimated. The `hourly` method substitutes hour by hour; `daily` is all-or-nothing
+(a partial sum would pass for a full day's total), so a day containing a stuck
+daylight run is estimated in full. Each detection is logged as a warning naming the
+sensor — the only place the fault is visible, so it is worth watching for.
+
+Running with **no `solar_radiation` sensor configured at all** now takes the same
+estimate rather than assuming zero radiation, which is a large improvement over the
+previous behaviour — but it is still an estimate, and a real sensor remains
+strongly preferred.
 
 ## Entities
 
@@ -259,10 +295,15 @@ for (seeing the raw balance), and it is why the run-time is not computed from it
   per-step clamps erase it as soon as any rain fills the soil or the depletion
   reaches `maximum_deficit`. See *Why clamping every step matters*.
 * **Solar is integrated from hourly statistics.** Daily radiation is the sum of the
-  covered hours' mean irradiance. Recorder gaps at night are harmless (0), but
-  daytime gaps under-count the day's energy and slightly under-estimate ET. An hour
-  with rain statistics but no temperature statistics is kept, with ETo 0 — losing
-  the rain would be the far worse error.
+  covered hours' mean irradiance. An hour with rain statistics but no temperature
+  statistics is kept, with ETo 0 — losing the rain would be the far worse error.
+* **The radiation fallback is an estimate, and detection is heuristic.** Eq. 50 is
+  a climatological correlation, not a measurement: expect a few tens of percent of
+  error on any single day. And a sensor stuck at a value that *happens* to drift,
+  or for a single hour, is indistinguishable from real weather and is not caught.
+  Under the `daily` method, hours simply missing from the recorder (as opposed to
+  stuck) are still summed as a partial total unless the whole day is absent — one
+  more reason to use the default `hourly`.
 * **Single-layer bucket.** No root-depth profile, no percolation curve, no capillary
   rise. Infiltration is capped and everything above field capacity is gone the same
   step.
@@ -295,6 +336,21 @@ for (seeing the raw balance), and it is why the run-time is not computed from it
   rewritten; on `…_hourly_rain` and `…_hourly_runoff` it is overwritten by the
   next rewrite (restart, `reload`, `recalculate`) while the hour is still inside
   `max_window_days`.
+
+## Upgrading to 0.3.0
+
+0.3.0 stops trusting the solar radiation sensor blindly — see *Missing or stuck
+solar radiation*. Nothing in your YAML has to change, and no entity changes.
+
+* **A stuck pyranometer no longer inflates ETo**, so if yours has been freezing,
+  expect noticeably *smaller* deficits and shorter run-times. Watch the log for the
+  `solar sensor … frozen at a single value` warning to know whether this applies to
+  you.
+* **Hours with no radiation row are now estimated instead of counted as zero**, so
+  a station with daytime recorder gaps — or no solar sensor at all — will report
+  *larger* deficits than before. The old behaviour silently assumed pitch darkness.
+* Both effects are corrections, not regressions; they move the estimate towards
+  what FAO-56 prescribes.
 
 ## Upgrading from 0.1.x
 
